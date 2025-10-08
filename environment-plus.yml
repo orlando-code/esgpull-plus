@@ -1,0 +1,31 @@
+name: esgpullplus
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  
+  # Scientific computing packages (conda-forge)
+  - pandas>=2.0.0
+  - xarray>=2023.1.0
+  - numpy>=1.24.0
+  - requests>=2.28.0
+  
+  # Development tools (optional - install with --dev flag)
+  - pytest>=7.0.0
+  - pytest-cov>=4.0.0
+  - black>=23.0.0
+  - isort>=5.12.0
+  - flake8>=6.0.0
+  - mypy>=1.0.0
+  - ipython>=8.0.0
+  - jupyter>=1.0.0
+  
+  # Install via pip (packages not available in conda-forge or with better pip versions)
+  - pip:
+    - xesmf>=0.8.0
+    - cdo-python>=0.5.6
+    - watchdog>=3.0.0
+    - orjson>=3.8.0
+    - rich>=12.6.0
