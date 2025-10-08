@@ -4,6 +4,16 @@
 
 `esgpull` is a tool that simplifies usage of the [ESGF Search API](https://esgf.github.io/esg-search/ESGF_Search_RESTful_API.html) for data discovery, and manages procedures related to downloading and storing files from ESGF.
 
+This respository, `esgpull-plus`, modifies and extends the functionality of `esgpull` by adding an API allowing file download via a `yaml` configuration file. This aims to make the download process more streamlined and improve reproducibility.
+
+In addition, `esgpull-plus` uses `xesmf` and `cdo` to allow immediate regridding of downloaded CMIP files onto the desired projection. This is useful given that many CMIP models - especially those dealing with ocean variables - output data on unstructured grids.
+
+Finally, `esgpull-plus` allows file subsetting, both for specified levels and custom subsetting to extract variable conditions at the sea floor.
+
+
+Follow instructions in XX for installation.
+1. This includes needing to run `esgpull self install` (as specified [here](https://esgf.github.io/esgf-download/installation/)).
+
 ```py
 from esgpull import Esgpull, Query
 
