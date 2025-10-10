@@ -11,6 +11,11 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Researchers",
+    "Topic :: Donwloading :: Research"
 ]
 description = "Extension of the original ESGF data discovery, download, replication package, esgpull"
 authors = [{ name = "Orlando Timmerman", email = "rt582@cam.ac.uk" }]
@@ -44,7 +49,6 @@ dependencies = [
     "xarray>=2023.1.0",
     "xesmf>=0.8.0",
     "numpy>=1.24.0",
-    "python-cdo>=1.6.1",
     "watchdog>=3.0.0",
     "requests>=2.28.0",
     "orjson>=3.8.0",
@@ -53,11 +57,13 @@ license.text = "BSD-3-Clause"
 
 [project.scripts]
 esgpull = "esgpull.cli:main"
-esgpullplus = "esgpull.esgpullplus.api:main"
+esgpullplus-download = "esgpull.esgpullplus.api:main"
 
 [project.urls]
 Repository = "https://github.com/orlando-code/esgpull-plus"
 Documentation = "https://github.com/orlando-code/esgpull-plus"
+Issues = "https://github.com/orlando-code/esgpull-plus/issues"
+Changelog = "https://github.com/orlando-code/esgpull-plus/blob/main/CHANGELOG.md"
 Original_respository = "https://github.com/ESGF/esgf-download"
 Original_documentation = "https://esgf.github.io/esgf-download/"
 
@@ -138,3 +144,10 @@ dev = [
     "types-requests>=2.28.0",
     "types-python-dateutil>=2.8.0",
 ]
+
+# Note: Some dependencies are only available via conda-forge, not PyPI:
+# - python-cdo (Climate Data Operators Python wrapper)
+# - cdo (Climate Data Operators command-line tool)
+# 
+# To install these, use conda:
+# conda install -c conda-forge python-cdo cdo
