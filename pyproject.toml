@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "esgpull"
+name = "esgpull-plus"
 version = "0.9.2"
 classifiers = [
     "License :: OSI Approved :: BSD License",
@@ -12,8 +12,8 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
-description = "ESGF data discovery, download, replication tool"
-authors = [{ name = "Sven Rodriguez", email = "srodriguez@ipsl.fr" }]
+description = "Extension of the original ESGF data discovery, download, replication package, esgpull"
+authors = [{ name = "Orlando Timmerman", email = "rt582@cam.ac.uk" }]
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -42,10 +42,13 @@ license.text = "BSD-3-Clause"
 
 [project.scripts]
 esgpull = "esgpull.cli:main"
+esgpullplus = "esgpull.esgpullplus.api:main"
 
 [project.urls]
-Repository = "https://github.com/ESGF/esgf-download"
-Documentation = "https://esgf.github.io/esgf-download/"
+Repository = "https://github.com/orlando-code/esgpull-plus"
+Documentation = "https://github.com/orlando-code/esgpull-plus"
+Original_respository = "https://github.com/ESGF/esgf-download"
+Original_documentation = "https://esgf.github.io/esgf-download/"
 
 [tool.black]
 line-length = 79
