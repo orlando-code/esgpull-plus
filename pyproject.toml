@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "esgpullplustest"
+name = "esgpullplus"
 version = "0.0.1"
 classifiers = [
     "License :: OSI Approved :: BSD License",
