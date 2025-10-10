@@ -17,6 +17,7 @@ authors = [{ name = "Orlando Timmerman", email = "rt582@cam.ac.uk" }]
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    # Base esgpull dependencies
     "aiofiles>=22.1.0",
     "alembic>=1.8.1",
     "click>=8.1.3",
@@ -37,6 +38,16 @@ dependencies = [
     "packaging>=25.0",
     "pydantic>=2.11.7",
     "pydantic-settings>=2.10.1",
+    
+    # esgpullplus additional dependencies
+    "pandas>=2.0.0",
+    "xarray>=2023.1.0",
+    "xesmf>=0.8.0",
+    "numpy>=1.24.0",
+    "cdo-python>=0.5.6",
+    "watchdog>=3.0.0",
+    "requests>=2.28.0",
+    "orjson>=3.8.0",
 ]
 license.text = "BSD-3-Clause"
 
@@ -116,4 +127,14 @@ dev = [
     "pytest-cov>=6.1.1",
     "pytest-mypy>=1.0.1",
     "pytest-xdist>=3.6.1",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "isort>=5.12.0",
+    "flake8>=6.0.0",
+    "mypy>=1.0.0",
+    "ipython>=8.0.0",
+    "jupyter>=1.0.0",
+    "pre-commit>=3.0.0",
+    "types-requests>=2.28.0",
+    "types-python-dateutil>=2.8.0",
 ]
