@@ -18,7 +18,7 @@ classifiers = [
 description = "Extension of the original ESGF data discovery, download, replication package, esgpull"
 authors = [{ name = "Orlando Timmerman", email = "rt582@cam.ac.uk" }]
 readme = "README.md"
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.10"
 dependencies = [
     # Base esgpull dependencies
     "aiofiles>=22.1.0",
@@ -45,7 +45,7 @@ dependencies = [
     # esgpullplus additional dependencies
     "pandas>=2.0.0",
     "xarray>=2023.1.0",
-    "xesmf>=0.8.0",
+    # "xesmf>=0.8.0",  # Temporarily disabled - requires Python <3.14
     "numpy>=1.24.0",
     "watchdog>=3.0.0",
     "requests>=2.28.0",
