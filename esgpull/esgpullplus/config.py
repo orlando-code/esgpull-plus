@@ -16,3 +16,4 @@ def get_repo_root():
 
 repo_dir = get_repo_root()
 log_dir = repo_dir / "logs"
+search_criteria_fp = repo_dir / "search.yaml"
