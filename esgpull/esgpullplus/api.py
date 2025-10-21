@@ -372,12 +372,7 @@ def search_and_download(search_criteria, meta_criteria, API=None):
     if not files:
         rich_print("No files found matching the search criteria.")
         return
-
-    # Check for shutdown request before starting download
-    if _shutdown_requested.is_set():
-        rich_print("[yellow]Shutdown requested, skipping download.[/yellow]")
-        return
-
+    
     # Determine batch size based on system resources and file count
     requested_batch_size = meta_criteria.get("batch_size", 50)  # Default batch size
     adaptive_batch_size = search_results._get_adaptive_batch_size(requested_batch_size, len(files))
