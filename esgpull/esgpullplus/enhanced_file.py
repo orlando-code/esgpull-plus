@@ -10,6 +10,8 @@ from esgpull.models import File as FileStatus
 # from esgpull.models.file import FileDict as BaseFileDict
 from esgpull.models.utils import find_str, find_int, get_local_path
 from esgpull.models.base import Base
+from esgpull.models import File
+
 
 class EnhancedFile(Base):
     """
@@ -337,11 +339,22 @@ class EnhancedFile(Base):
         
         return result
 
-# Convenience functions
+
 def create_enhanced_file_from_search_result(search_result: dict) -> EnhancedFile:
     """Create an EnhancedFile from a search result dictionary."""
     return EnhancedFile.serialize(search_result)
 
+
 def create_enhanced_files_from_search_results(search_results: List[dict]) -> List[EnhancedFile]:
     """Create a list of EnhancedFile objects from search result dictionaries."""
     return [create_enhanced_file_from_search_result(result) for result in search_results]
+
+
+def convert_base_files_to_enhanced(base_files: list[File], metadata: dict = None) -> list[EnhancedFile]:
+    """Convert a list of base File objects to EnhancedFile objects."""
+    enhanced_files = []
+    
+    for base_file in base_files:
+        enhanced_file = EnhancedFile.fromdict(dict(base_file.asdict(), **metadata.get(base_file.file_id, {}) if metadata else {}))
+        enhanced_files.append(enhanced_file)
+    return enhanced_files
