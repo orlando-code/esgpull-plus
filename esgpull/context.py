@@ -22,10 +22,14 @@ from esgpull.tui import logger
 from esgpull.utils import format_date_iso, sync
 
 # workaround for notebooks with running event loop
-if asyncio.get_event_loop().is_running():
-    import nest_asyncio
-
-    nest_asyncio.apply()
+# TODO: I don't want this file to be modified
+try:
+    if asyncio.get_event_loop().is_running():
+        import nest_asyncio
+        nest_asyncio.apply()
+except RuntimeError:
+    # No event loop exists, which is fine for normal execution
+    pass
 
 
 T = TypeVar("T")
