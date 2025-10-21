@@ -11,10 +11,9 @@ from rich.panel import Panel
 from rich.table import Table
 
 # custom
-from esgpull.esgpullplus import api, fileops
-from esgpull.esgpullplus.models import ExtendedFile, create_extended_file_dict
-from esgpull.models import File
-
+from esgpull.esgpullplus import api, fileops, config
+from esgpull.esgpullplus.enhanced_file import EnhancedFile
+    
 
 class SearchResults:
     """
@@ -24,18 +23,18 @@ class SearchResults:
 
     def __init__(
         self,
-        search_criteria: dict,
-        meta_criteria: dict,
+        search_criteria: Optional[dict] = None,
+        meta_criteria: Optional[dict] = None,
         config_path: Optional[str] = None,
     ):
-        self.search_criteria = search_criteria
-        self.meta_criteria = meta_criteria
-        self.search_filter = search_criteria.get("filter", {})  # Default to empty dict if not specified
-        self.top_n = self.search_filter.get("top_n", None)  # Default to None if not specified
-        self.limit = self.search_filter.get("limit", 4)   # good for debugging
-        self.search_results = []  # List to hold ExtendedFile objects
+        self.search_criteria = search_criteria if search_criteria else {}
+        self.meta_criteria = meta_criteria if meta_criteria else {}
+        self.search_filter = self.search_criteria.get("filter", {})
+        self.top_n = self.search_filter.get("top_n", None)
+        self.limit = self.search_filter.get("limit", 4)   # limit results to return, good for debugging
+        self.search_results = []  # List to hold EnhancedFile objects from search
         self.results_df = None  # DataFrame to hold results for further processing
-        self.results_df_top = None  # DataFrame for top N results
+        self.results_df_top = None  # DataFrame for top N results from search
         self.fs = api.EsgpullAPI().esg.fs  # File system from Esgpull API
         self.search_results_dir = self.fs.paths.data / "search_results"
 
@@ -49,31 +48,31 @@ class SearchResults:
         self.limit = self.search_filter.get("limit", 4)   # good for debugging
 
     def do_search(self) -> None:
-        """Perform a search using the provided criteria and populate results."""
+        """Perform a search using the provided criteria and populate results with enhanced metadata."""
         api_instance = api.EsgpullAPI()
-        # TODO: ERROR IN SEARCH, NOT FINDING ANY FILES
+        
+        # Use enhanced search to get all available metadata
         results = api_instance.search(criteria=self.search_criteria)
         
-        # Convert results to extended file dictionaries
-        extended_results = []
+        # Convert results to enhanced file dictionaries for future processing
+        enhanced_results = []
         for result in results:
             if isinstance(result, dict):
-                extended_results.append(create_extended_file_dict(result))
+                # result is already enhanced from search_enhanced
+                enhanced_results.append(result)
             else:
-                # If result is a File object, convert to dict first
-                result_dict = result.__dict__.copy()
-                if "_sa_instance_state" in result_dict:
-                    del result_dict["_sa_instance_state"]
-                extended_results.append(create_extended_file_dict(result_dict))
+                # Fallback: create enhanced file from result
+                enhanced_file = EnhancedFile.fromdict(result)
+                enhanced_results.append(enhanced_file.asdict())
         
-        self.results_df = pd.DataFrame(extended_results)
+        self.results_df = pd.DataFrame(enhanced_results)
         if not self.results_df.empty:
             return self.sort_results_by_metadata()
         else:
             print("[SearchResults] No results found for given criteria.")
 
     def sort_results_by_metadata(self) -> None:
-        """Sort a list of ExtendedFile objects by institution_id, source_id, experiment_id, member_id."""
+        """Sort a list of EnhancedFile objects by institution_id, source_id, experiment_id, member_id."""
         if self.results_df is None or self.results_df.empty:
             print("[SearchResults] No results to sort.")
             return
@@ -81,13 +80,13 @@ class SearchResults:
         resolutions = self.results_df.apply(
             lambda f: self.calc_resolution(f.nominal_resolution), axis=1
         )
-        self.results_df["nominal_resolution"] = resolutions
+        self.results_df["resolution"] = resolutions
         self.results_df = self.results_df.sort_values(
-            by=["nominal_resolution", "dataset_id"]
+            by=["resolution", "dataset_id"]
         )
-        # Update self.search_results to match the sorted DataFrame
+        # update self.search_results to match the sorted DataFrame for future processing
         self.search_results = [
-            ExtendedFile(**dict({k: v for k, v in row.items() if k != "_sa_instance_state"}))
+            EnhancedFile.fromdict(dict({k: v for k, v in row.items() if k != "_sa_instance_state"}))
             for _, row in self.results_df.iterrows()
         ]
 
@@ -127,11 +126,11 @@ class SearchResults:
                     search_table.add_row(str(fk), str(fv))
             else:
                 search_table.add_row(str(k), str(v))
-            
-        # if search_state == "pre":
-        console.print(
-            Panel(search_table, title="[cyan]Starting Search", border_style="cyan")
-        )
+        if search_state == "pre":
+            # display search criteria
+            console.print(
+                Panel(search_table, title="[cyan]Starting Search", border_style="cyan")
+            )
         if search_state == "post":
             if len(self.search_results) == self.limit:
                 match_msg = " [orange1](limit of search reached)[/orange1]"
@@ -157,6 +156,7 @@ class SearchResults:
         return self.results_df[self.results_df["dataset_id"].isin(top_dataset_ids)]
 
     def clean_and_join_dict_vals(self):
+        """Clean and join dictionary values to create a descriptive search ID for saving search results."""
         def clean_value(val):
             if isinstance(val, int):
                 return str(val)
@@ -168,39 +168,39 @@ class SearchResults:
                 return val.strip()
             return str(val)
 
-        # Clean all values, excluding the filter key
+        # clean all values, excluding the filter key (since this is a dictionary of strings)
         cleaned_str = [clean_value(v) for k, v in self.search_criteria.items() if k != "filter"]
-        # order alphabetically
+        # order alphabetically in place to ensure consistent naming
         cleaned_str.sort()
         return "SEARCH_" + "_".join(cleaned_str).replace(" ", "")
 
     def check_system_resources(self, output_dir=None):
-        """Check system resources and warn if they might be insufficient."""
+        """Check system resources and warn if they might be insufficient. Used to adjust batch size based on system resources."""
         try:
             import psutil
         except ImportError:
             print("[yellow]Warning: psutil not available. Cannot check system resources.[/yellow]")
             return
         
-        # Check memory usage
+        # check memory usage
         memory = psutil.virtual_memory()
         if memory.percent > 80:
             print(f"[yellow]Warning: High memory usage ({memory.percent:.1f}%). Consider reducing batch size.[/yellow]")
         
-        # Check available disk space if output_dir is provided
+        # check available disk space if output_dir is provided
         if output_dir:
             try:
                 disk = psutil.disk_usage(str(output_dir))
                 free_gb = disk.free / (1024**3)
-                if free_gb < 10:  # Less than 10GB free
+                if free_gb < 10:  # less than 10GB free
                     print(f"[yellow]Warning: Low disk space ({free_gb:.1f}GB free). Ensure sufficient space for downloads.[/yellow]")
             except (OSError, PermissionError):
                 print("[yellow]Warning: Could not check disk space.[/yellow]")
         
-        # Check file descriptor limit (Unix systems)
+        # check file descriptor limit (Unix systems)
         if hasattr(os, 'getrlimit'):
             try:
-                soft, hard = os.getrlimit(os.RLIMIT_NOFILE)
+                soft, _ = os.getrlimit(os.RLIMIT_NOFILE)
                 if soft < 1000:
                     print(f"[yellow]Warning: Low file descriptor limit ({soft}). May cause issues with many concurrent downloads.[/yellow]")
             except (OSError, AttributeError):
@@ -211,23 +211,23 @@ class SearchResults:
         try:
             import psutil
         except ImportError:
-            # If psutil not available, use conservative defaults
+            # if psutil not available, use conservative defaults
             if total_files > 1000:
                 return min(requested_batch_size, 25)
             elif total_files > 500:
                 return min(requested_batch_size, 40)
             return max(requested_batch_size, 5)
         
-        # Start with requested batch size
+        # start with requested batch size
         batch_size = requested_batch_size
         
-        # Reduce batch size for very large file counts
+        # reduce batch size for very large file counts
         if total_files > 1000:
             batch_size = min(batch_size, 25)
         elif total_files > 500:
             batch_size = min(batch_size, 40)
         
-        # Check memory usage and reduce batch size if high
+        # check memory usage and reduce batch size if high
         try:
             memory = psutil.virtual_memory()
             if memory.percent > 70:
@@ -235,19 +235,16 @@ class SearchResults:
             elif memory.percent > 50:
                 batch_size = min(batch_size, 35)
         except Exception:
-            pass  # If we can't check memory, use the current batch size
+            pass  # if memory check fails, use the current batch size
         
-        # Ensure minimum batch size
-        batch_size = max(batch_size, 5)
-        
-        return batch_size
+        # return ensured minimum batch size
+        return max(batch_size, 5)
 
     def save_searches(self) -> None:
-        """Save the search results to a CSV file."""
+        """Save the search results to a CSV file for future use and record keeping."""
         # check if search directory exists, if not create it
-        # search_dir = self.fs.auth.parent / "search_results"
         self.search_results_dir.mkdir(parents=True, exist_ok=True)
-        self.search_id = self.clean_and_join_dict_vals()
+        self.search_id = self.clean_and_join_dict_vals()    # create search id for filepath
         self.search_results_fp = self.search_results_dir / f"{self.search_id}.csv"
         if self.results_df is None:
             raise ValueError("No results to save. Run do_search() first.")
@@ -269,27 +266,24 @@ class SearchResults:
                 self.results_df = self.results_df.drop(columns=["_sa_instance_state"])
             self.search_results_fp = search_fp
             self.search_results = [
-                ExtendedFile(**dict({k: v for k, v in row.items() if k != "_sa_instance_state"}))
+                EnhancedFile.fromdict(dict({k: v for k, v in row.items() if k != "_sa_instance_state"}))
                 for _, row in self.results_df.iterrows()
             ]
             return self.results_df
         else:
             raise FileNotFoundError(f"Search results file {search_fp} not found.")
 
-    def run(self) -> list[ExtendedFile]:
-        """Perform search, sort, and return top n results as ExtendedFile objects. Loads from cache if available, else performs search and saves."""
+    def run(self) -> list[EnhancedFile]:
+        """Perform search, sort, and return top n results as EnhancedFile objects. Loads from cache if available, else performs search and saves."""
         if not self.search_criteria or not self.meta_criteria:
-            self.load_config(fileops.read_yaml(fileops.REPO_ROOT / "search.yaml"))
-        # print(
-        #     "[SearchResults] Running search with the following criteria:"
-        #     f"\n{self.meta_criteria}"
-        # )
-        # Try to load from cache if available, else perform search and save
+            self.load_config(config.search_criteria_fp)
+        # try to load from cache if available
         try:
             self.search_id = self.clean_and_join_dict_vals()
             self.load_search_results()
             print(f"Loaded search results from cache: {self.search_results_fp}")
             self.search_message("post")
+        # if search results file not found, perform search and save
         except FileNotFoundError:
             self.search_message("pre")
             self.do_search()
@@ -299,9 +293,48 @@ class SearchResults:
             self.search_message("post")
             self.sort_results_by_metadata()
             self.save_searches()
-        # Always get top_n from the current results_df
+        # always get top_n from the current results_df
         top_n_df = self.get_top_n() if self.top_n else self.results_df
-        # limit
+        # limit results to return
         if self.limit and top_n_df is not None:
             top_n_df = top_n_df.head(self.limit)
-        return [ExtendedFile(**dict(row)) for _, row in top_n_df.iterrows()]
+        return top_n_df
+
+    def get_enhanced_metadata_summary(self) -> dict:
+        """Get a summary of all available enhanced metadata fields."""
+        if self.results_df is None or self.results_df.empty:
+            return {}
+        
+        # Get all metadata fields (excluding base file fields)
+        base_fields = {'file_id', 'dataset_id', 'master_id', 'url', 'version', 'filename', 'local_path', 'data_node', 'checksum', 'checksum_type', 'size', 'status'}
+        metadata_fields = [col for col in self.results_df.columns if col not in base_fields]
+        
+        summary = {}
+        for field in metadata_fields:
+            unique_values = self.results_df[field].dropna().unique()
+            if len(unique_values) > 0:
+                summary[field] = {
+                    'count': len(unique_values),
+                    'values': list(unique_values[:5]) if len(unique_values) > 5 else list(unique_values),
+                    'has_more': len(unique_values) > 5
+                }
+        
+        return summary
+
+    def display_enhanced_metadata_info(self) -> None:
+        """Display information about available enhanced metadata."""
+        summary = self.get_enhanced_metadata_summary()
+        
+        if not summary:
+            print("[SearchResults] No enhanced metadata available.")
+            return
+        
+        print(f"\n[SearchResults] Enhanced Metadata Summary:")
+        print(f"Total metadata fields: {len(summary)}")
+        
+        for field, info in summary.items():
+            print(f"  {field}: {info['count']} unique values")
+            if info['has_more']:
+                print(f"    Examples: {', '.join(map(str, info['values']))}...")
+            else:
+                print(f"    Values: {', '.join(map(str, info['values']))}")
