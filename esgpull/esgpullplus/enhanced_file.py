@@ -6,7 +6,7 @@ This approach is more focused and only adds what's necessary to capture addition
 from typing import Any, Dict, List, Optional
 import sqlalchemy as sa
 from sqlalchemy.orm import Mapped, mapped_column
-from esgpull.models import File as FileStatus
+from esgpull.models.file import FileStatus
 # from esgpull.models.file import FileDict as BaseFileDict
 from esgpull.models.utils import find_str, find_int, get_local_path
 from esgpull.models.base import Base
@@ -143,6 +143,7 @@ class EnhancedFile(Base):
             checksum=checksum,
             checksum_type=checksum_type,
             size=size,
+            status=FileStatus.New,
         )
         
         # Extract and set all extended metadata fields
@@ -272,12 +273,16 @@ class EnhancedFile(Base):
             'size': source.get('size', 0),
         }
         
-        # Create the enhanced file
-        result = cls(**base_fields)
-        
         # Set status if provided
+        status = FileStatus.New
         if 'status' in source:
-            result.status = FileStatus(source.get('status', '').lower())
+            try:
+                status = FileStatus(source.get('status', '').lower())
+            except (ValueError, AttributeError):
+                status = FileStatus.New
+        
+        # Create the enhanced file
+        result = cls(**base_fields, status=status)
         
         # Set all extended metadata fields
         extended_fields = [
