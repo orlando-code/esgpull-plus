@@ -298,7 +298,8 @@ class SearchResults:
         # limit results to return
         if self.limit and top_n_df is not None:
             top_n_df = top_n_df.head(self.limit)
-        return top_n_df
+
+        return [EnhancedFile.fromdict(dict({k: v for k, v in row.items() if k != "_sa_instance_state"})) for _, row in top_n_df.iterrows()]
 
     def get_enhanced_metadata_summary(self) -> dict:
         """Get a summary of all available enhanced metadata fields."""
