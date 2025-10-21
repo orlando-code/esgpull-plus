@@ -16,14 +16,13 @@ from esgpull.cli.utils import (
 # TO DO
 # XX processing box
 
-
 # custom
 from esgpull.esgpullplus import api, download, fileops, search, esgpuller
+from esgpull.esgpullplus.enhanced_context import Context
 from esgpull.graph import Graph
 from esgpull.models import File, Query
 from esgpull.tui import Verbosity
 from esgpull.utils import sync
-
 
 # Global flag for graceful shutdown
 _shutdown_requested = threading.Event()
@@ -84,7 +83,7 @@ class EsgpullAPI:
         Searches ESGF nodes for files/datasets matching the criteria.
 
         Args:
-            criteria: A dictionary of search facets (e.g., project, variable).
+            criteria (dict): A dictionary of search facets (e.g., project, variable).
                       Can include 'limit' to restrict the number of results.
 
         Returns:
@@ -107,8 +106,9 @@ class EsgpullAPI:
         )
         query.compute_sha()
         self.esg.graph.resolve_require(query)
-        results = self.esg.context.search(query, file=True, max_hits=max_hits)
-        return [cast(Dict[str, Any], r.asdict()) for r in results]
+        results = Context.search(query, file=True, max_hits=max_hits)
+        return [result.asdict() for result in results]
+
 
     def add(self, criteria: Dict[str, Any], track: bool = False) -> None:
         """
