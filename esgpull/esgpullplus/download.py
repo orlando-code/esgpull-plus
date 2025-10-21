@@ -39,7 +39,8 @@ class DownloadSubset:
         if self.output_dir:
             return Path(self.output_dir) / file.filename
         else:
-            return self.fs[file].drs
+            # return self.fs[file].drs
+            return self.fs.paths.data / file.local_path / file.filename
 
     def file_exists(self, file):
         file_path = self.get_file_path(file)
