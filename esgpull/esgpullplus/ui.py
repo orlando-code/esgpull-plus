@@ -13,6 +13,9 @@ from datetime import datetime
 # custom
 from esgpull.esgpullplus import config
 
+# TODO: remove FAILED files from UI after 10s (like with successful files)
+# TODO: fix incorrectly marked failed files
+# TODO: fix files mislabelled as cancelled in final summary
 
 class DownloadProgressUI:
     """Manages rich progress bars for overall and per-file download, with status in the bar description."""
@@ -45,7 +48,7 @@ class DownloadProgressUI:
         self._setup_logger()
 
     def _setup_logger(self):
-        self.logger = logging.getLogger(f"download_errors_{id(self)}")
+        self.logger = logging.getLogger(f"download_errors_{id(self)}")  # TODO: this isn't working (nothing written)
         self.logger.setLevel(logging.ERROR)
 
         # Create logs directory next to the current file
@@ -148,11 +151,20 @@ class DownloadProgressUI:
             Panel(table, title="[white]Download Summary", border_style="white")
         )
         if self.failed_files:
+            console.print(f"\n[red]Failed Files ({len(self.failed_files)}):[/red]")
+            for i, (file, msg) in enumerate(self.failed_files):
+                console.print(f"[red]{i+1}. {file.filename}[/red]")
+                console.print(f"   [red]Error: {msg}[/red]")
+                console.print(f"   [red]URL: {file.url}[/red]")
+                console.print(f"   [red]Data Node: {getattr(file, 'data_node', 'Unknown')}[/red]")
+                console.print("")
+            
+            # Show first failure in detail
             file, msg = self.failed_files[0]
             console.print(
                 Panel(
-                    f"Example failed file: [bold]{file.filename}[/bold]\n[red]{msg}[/red]",
-                    title="[red]Failure Example[/red]",
+                    f"First failed file: [bold]{file.filename}[/bold]\n[red]{msg}[/red]\n\nURL: {file.url}\nData Node: {getattr(file, 'data_node', 'Unknown')}",
+                    title="[red]Detailed Failure Info[/red]",
                     style="red",
                 )
             )
