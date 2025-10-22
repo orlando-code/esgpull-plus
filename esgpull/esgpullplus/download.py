@@ -9,8 +9,6 @@ import requests
 # spatial
 import xarray as xa
 
-# from esgpulllite.custom import ui
-
 from esgpull.esgpullplus import ui
 from esgpull import utils
 # parallel
@@ -26,6 +24,7 @@ class DownloadSubset:
         subset=None,
         max_workers=4,
         force_direct_download=False,
+        verbose=False,
     ):
         self.files = files
         self.fs = fs
@@ -33,6 +32,7 @@ class DownloadSubset:
         self.subset = subset
         self.max_workers = max_workers if max_workers < len(files) else len(files)
         self.force_direct_download = force_direct_download
+        self.verbose = verbose
         self._shutdown_requested = threading.Event()
 
     def get_file_path(self, file):
@@ -104,6 +104,15 @@ class DownloadSubset:
                 ui_instance.set_status(file, "FAILED", "red")
                 ui_instance.complete_file(file)
         except Exception as e:
+            import traceback
+            error_msg = f"Processing failed for {file.filename}: {e}"
+            print(f"\n[ERROR] {error_msg}")
+            print(f"[ERROR] Full traceback:")
+            traceback.print_exc()
+            print(f"[ERROR] URL: {file.url}")
+            print(f"[ERROR] File size: {file.size}")
+            print(f"[ERROR] Data node: {getattr(file, 'data_node', 'Unknown')}")
+            print("-" * 80)
             ui_instance.set_status(file, "ERROR", "red")
             ui_instance.add_failed(file, f"Error: {e}", e)
             ui_instance.complete_file(file)
@@ -134,7 +143,23 @@ class DownloadSubset:
             ui_instance.set_status(file, "SAVING", "yellow")
             return self._save_dataset(file, ds)
         except Exception as e:
-            print(f"xarray download failed for {file.filename}: {e}")
+            import traceback
+            error_msg = f"xarray download failed for {file.filename}: {e}"
+            print(f"\n[ERROR] {error_msg}")
+            print(f"[ERROR] Full traceback:")
+            traceback.print_exc()
+            print(f"[ERROR] URL: {file.url}")
+            print(f"[ERROR] File size: {file.size}")
+            print(f"[ERROR] Data node: {getattr(file, 'data_node', 'Unknown')}")
+            print("-" * 80)
+            return False
+
+    def _test_url(self, url):
+        """Test if URL is accessible with a HEAD request."""
+        try:
+            response = requests.head(url, timeout=10)
+            return response.status_code == 200
+        except Exception:
             return False
 
     def _download_file_direct_ui(self, file, ui_instance):
@@ -163,9 +188,39 @@ class DownloadSubset:
                         ui_instance.update_file_progress(file, bytes_downloaded, total)
             if temp_path.exists() and temp_path.stat().st_size > 0:
                 temp_path.rename(file_path)
-                return True
+                # Verify the final file
+                if file_path.exists() and file_path.stat().st_size > 0 and self.verbose:
+                    print(f"[DEBUG] Successfully downloaded {file.filename} ({file_path.stat().st_size} bytes)")
+                    return True
+                else:
+                    print(f"[ERROR] Downloaded file {file.filename} is empty or missing after rename")
+                    return False
+            else:
+                print(f"[ERROR] Downloaded file {file.filename} is empty or missing")
+                return False
         except Exception as e:
-            print(f"Direct download failed for {file.filename}: {e}")
+            import traceback
+            error_msg = f"Direct download failed for {file.filename}: {e}"
+            print(f"\n[ERROR] {error_msg}")
+            print(f"[ERROR] Full traceback:")
+            traceback.print_exc()
+            print(f"[ERROR] URL: {file.url}")
+            print(f"[ERROR] File size: {file.size}")
+            print(f"[ERROR] Data node: {getattr(file, 'data_node', 'Unknown')}")
+            
+            # Additional debugging for common issues
+            if "timeout" in str(e).lower():
+                print(f"[ERROR] This appears to be a timeout issue. Try increasing timeout or check network connection.")
+            elif "connection" in str(e).lower():
+                print(f"[ERROR] This appears to be a connection issue. Check if the data node is accessible.")
+            elif "404" in str(e).lower() or "not found" in str(e).lower():
+                print(f"[ERROR] File not found. The URL may be incorrect or the file may have been moved.")
+            elif "403" in str(e).lower() or "forbidden" in str(e).lower():
+                print(f"[ERROR] Access forbidden. You may need authentication or the file may be restricted.")
+            elif "ssl" in str(e).lower() or "certificate" in str(e).lower():
+                print(f"[ERROR] SSL/Certificate issue. Try updating certificates or using a different data node.")
+            
+            print("-" * 80)
             for path in [temp_path, file_path]:
                 if path.exists():
                     try:
@@ -226,7 +281,15 @@ class DownloadSubset:
                 return True
 
         except Exception as e:
-            print(f"Save failed for {file.filename}: {e}")
+            import traceback
+            error_msg = f"Save failed for {file.filename}: {e}"
+            print(f"\n[ERROR] {error_msg}")
+            print(f"[ERROR] Full traceback:")
+            traceback.print_exc()
+            print(f"[ERROR] URL: {file.url}")
+            print(f"[ERROR] File size: {file.size}")
+            print(f"[ERROR] Data node: {getattr(file, 'data_node', 'Unknown')}")
+            print("-" * 80)
             # Cleanup
             for path in [temp_path, file_path]:
                 if path.exists():
