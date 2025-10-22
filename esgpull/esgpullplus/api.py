@@ -411,6 +411,7 @@ def search_and_download(search_criteria, meta_criteria, API=None):
                     output_dir=output_dir,
                     subset=meta_criteria.get("subset"),
                     max_workers=meta_criteria.get("max_workers", 32),
+                    verbose=meta_criteria.get("verbose", False),
                 )
 
                 # Pass shutdown event to download manager
