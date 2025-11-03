@@ -21,62 +21,18 @@ import logging
 import traceback
 from concurrent.futures import ProcessPoolExecutor
 
-import numpy as np
+import time
+# import numpy as np
 import xarray as xa
 from cdo import Cdo
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn, TimeRemainingColumn    # TODO: make a nice processing UI
-from rich.live import Live
+# from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn, TimeRemainingColumn    # TODO: make a nice processing UI
+# from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 
-from esgpull.esgpullplus import utils
+from esgpull.esgpullplus import utils, fileops
 from esgpull.esgpullplus.regrid_ui import RegridProgressUI, BatchRegridUI
-
-
-def cleanup_problematic_files(directory: Path, verbose: bool = True) -> int:
-    """
-    Clean up problematic files (_top_level and _chunk_) in a directory.
-    
-    Args:
-        directory (Path): Directory to clean up
-        verbose (bool): Whether to print verbose output
-        
-    Returns:
-        int: Number of files cleaned up
-    """
-    cleaned_count = 0
-    
-    if verbose:
-        console = Console()
-        console.print(f"[blue]Cleaning up problematic files in: {directory}[/blue]")
-    
-    # Find and remove _top_level files
-    for file_path in directory.rglob("*_top_level.nc"):
-        try:
-            file_path.unlink()
-            cleaned_count += 1
-            if verbose:
-                console.print(f"[yellow]Removed: {file_path.name}[/yellow]")
-        except Exception as e:
-            if verbose:
-                console.print(f"[red]Could not remove {file_path.name}: {e}[/red]")
-    
-    # Find and remove _chunk_ files
-    for file_path in directory.rglob("*_chunk_*.nc"):
-        try:
-            file_path.unlink()
-            cleaned_count += 1
-            if verbose:
-                console.print(f"[yellow]Removed: {file_path.name}[/yellow]")
-        except Exception as e:
-            if verbose:
-                console.print(f"[red]Could not remove {file_path.name}: {e}[/red]")
-    
-    if verbose:
-        console.print(f"[green]Cleaned up {cleaned_count} problematic files[/green]")
-    
-    return cleaned_count
 
 
 def _process_single_file_standalone(
@@ -239,7 +195,6 @@ class CDORegridPipeline:
         enable_chunking: bool = True,
         memory_monitoring: bool = True,
         cleanup_weights: bool = False,
-        prune_regridded: bool = True,
     ):
         """
         Initialize the CDO regridding pipeline.
@@ -268,10 +223,7 @@ class CDORegridPipeline:
         self.enable_chunking = enable_chunking
         self.memory_monitoring = memory_monitoring
         self.cleanup_weights = cleanup_weights
-        self.prune_regridded = prune_regridded
-        
-        # prune regridded files if requested
-        
+                
         # ensure not requesting more workers than available
         if max_workers is None:
             self.max_workers = min(self.max_workers, mp.cpu_count())
@@ -315,41 +267,61 @@ class CDORegridPipeline:
         # cache for file info to avoid repeated expensive operations
         self._file_info_cache: dict[Path, dict] = {}
         
-        # Track created files for cleanup on interrupt
+        # track created files for cleanup on interrupt
         self._created_files: list[Path] = []
         self._setup_signal_handlers()
         
-        # Timing tracking
-        self._start_time: Optional[float] = None
-        self._end_time: Optional[float] = None
+        # timing tracking
+        self._start_time: Optional[time.struct_time] = None
+        self.end_time: Optional[time.struct_time] = None
         
     def _prune_regridded(self, input_files: list[Path], overwrite: bool = False) -> list[Path]:
         """Prune files with 'regridded' in the name to avoid processing them twice."""
         if self.prune_regridded:
-            if overwrite:
-                # Delete existing regridded files when overwrite=True
+            if overwrite:   # delete existing regridded files
                 for file in input_files:
                     if 'regridded' in file.name:
                         if self.verbose:
                             self.console.print(f"[yellow]Removing existing regridded file: {file.name}[/yellow]")
                         file.unlink()
-            else:
-                # When overwrite=False, just skip existing regridded files
+            else:   # skip existing regridded files (don't regenerate)
                 if self.verbose:
                     regridded_files = [file for file in input_files if 'regridded' in file.name]
                     if regridded_files:
                         self.console.print(f"[blue]Skipping {len(regridded_files)} existing regridded files (overwrite=False)[/blue]")
         return [file for file in input_files if 'regridded' in file.name and not "_chunk_" in file.name]
     
-    def _cleanup_top_level_files(self, input_files: list[Path]) -> list[Path]:
-        """Clean up existing _top_level files that may cause HDF errors."""
+    def _cleanup_files_by_pattern(
+        self, 
+        input_files: list[Path], 
+        pattern: str,
+        file_type: str,
+        exclude_regridded: bool = False
+    ) -> list[Path]:
+        """Generic helper to clean up files matching a pattern.
+        
+        Args:
+            input_files: List of file paths to check
+            pattern: Pattern to match in filename (e.g., '_top_level', '_chunk_')
+            file_type: Description for logging (e.g., '_top_level', '_chunk_')
+            exclude_regridded: If True, exclude files with 'regridded' in name
+            
+        Returns:
+            List of cleaned files (with problematic files removed)
+        """
         cleaned_files = []
         removed_count = 0
         
         for file_path in input_files:
-            if '_top_level' in file_path.name and "regridded" not in file_path.name:
+            should_remove = pattern in file_path.name
+            if exclude_regridded and should_remove:
+                should_remove = "regridded" not in file_path.name
+            
+            if should_remove:
                 if self.verbose:
-                    self.console.print(f"[yellow]Removing problematic _top_level file: {file_path.name}[/yellow]")
+                    self.console.print(
+                        f"[yellow]Removing problematic {file_type} file: {file_path.name}[/yellow]"
+                    )
                 try:
                     file_path.unlink()
                     removed_count += 1
@@ -359,41 +331,44 @@ class CDORegridPipeline:
                 cleaned_files.append(file_path)
         
         if removed_count > 0 and self.verbose:
-            self.console.print(f"[blue]Cleaned up {removed_count} problematic _top_level files[/blue]")
+            self.console.print(
+                f"[blue]Cleaned up {removed_count} problematic {file_type} files[/blue]"
+            )
         
         return cleaned_files
+    
+    def _cleanup_top_level_files(self, input_files: list[Path]) -> list[Path]:
+        """Clean up existing _top_level files that may cause HDF errors."""
+        # TODO: why do I need to get rid of top_level files?
+        return self._cleanup_files_by_pattern(
+            input_files, 
+            pattern='_top_level',
+            file_type='_top_level',
+            exclude_regridded=True
+        )
     
     def _cleanup_chunk_files(self, input_files: list[Path]) -> list[Path]:
         """Clean up existing _chunk_ files that may cause HDF errors."""
-        cleaned_files = []
-        removed_count = 0
-        
-        for file_path in input_files:
-            if '_chunk_' in file_path.name:
-                if self.verbose:
-                    self.console.print(f"[yellow]Removing problematic _chunk_ file: {file_path.name}[/yellow]")
-                try:
-                    file_path.unlink()
-                    removed_count += 1
-                except Exception as e:
-                    self.logger.warning(f"Could not remove {file_path}: {e}")
-            else:
-                cleaned_files.append(file_path)
-        
-        if removed_count > 0 and self.verbose:
-            self.console.print(f"[blue]Cleaned up {removed_count} problematic _chunk_ files[/blue]")
-        
-        return cleaned_files
+        return self._cleanup_files_by_pattern(
+            input_files,
+            pattern='_chunk_',
+            file_type='_chunk_',
+            exclude_regridded=False
+        )
     
     def _cleanup_problematic_files(self, input_files: list[Path]) -> list[Path]:
         """Clean up all problematic files (_top_level and _chunk_) that may cause HDF errors."""
-        # First clean up _top_level files
-        cleaned_files = self._cleanup_top_level_files(input_files)
-        
-        # Then clean up _chunk_ files
-        cleaned_files = self._cleanup_chunk_files(cleaned_files)
-        
-        return cleaned_files
+        return self._cleanup_files_by_pattern(
+            input_files,
+            pattern='_top_level',
+            file_type='_top_level',
+            exclude_regridded=True # keep regridded top_level files (final form)
+        ) + self._cleanup_files_by_pattern(
+            input_files,
+            pattern='_chunk_',
+            file_type='_chunk_',
+            exclude_regridded=False # get rid of everything that's still a chunk
+        )
     
     def _setup_signal_handlers(self):
         """Set up signal handlers for graceful cleanup on keyboard interrupt."""
@@ -404,19 +379,18 @@ class CDORegridPipeline:
             if self.verbose:
                 self.console.print(f"\n[yellow]Received interrupt signal ({signum}). Cleaning up...[/yellow]")
             
-            # Clean up created files
             self._cleanup_created_files()
             
             if self.verbose:
                 self.console.print(f"[red]Interrupted. Cleaned up {len(self._created_files)} created files.[/red]")
             
-            # Exit gracefully
+            # exit gracefully
             import sys
             sys.exit(1)
         
-        # Register signal handlers
+        # register signal handlers
         signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
-        signal.signal(signal.SIGTERM, signal_handler)  # Termination signal
+        signal.signal(signal.SIGTERM, signal_handler)  # termination signal
     
     def _cleanup_created_files(self):
         """Clean up all files created during processing."""
@@ -429,51 +403,11 @@ class CDORegridPipeline:
             except Exception as e:
                 self.logger.warning(f"Could not clean up {file_path}: {e}")
         
-        # Clear the list
         self._created_files.clear()
     
     def _track_created_file(self, file_path: Path):
         """Track a file that was created during processing for cleanup."""
         self._created_files.append(file_path)
-    
-    def _start_timing(self):
-        """Start timing the processing."""
-        import time
-        self._start_time = time.time()
-        if self.verbose:
-            self.console.print(f"[blue]Processing started at {time.strftime('%H:%M:%S')}[/blue]")
-    
-    def _end_timing(self):
-        """End timing the processing."""
-        import time
-        self._end_time = time.time()
-        if self.verbose:
-            self.console.print(f"[blue]Processing completed at {time.strftime('%H:%M:%S')}[/blue]")
-    
-    def get_processing_time(self) -> Optional[float]:
-        """Get the total processing time in seconds."""
-        import time
-        if self._start_time is None:
-            return None
-        end_time = self._end_time if self._end_time is not None else time.time()
-        return end_time - self._start_time
-    
-    def format_processing_time(self) -> str:
-        """Format processing time in a human-readable format."""
-        processing_time = self.get_processing_time()
-        if processing_time is None:
-            return "Timing not available"
-        
-        hours = int(processing_time // 3600)
-        minutes = int((processing_time % 3600) // 60)
-        seconds = int(processing_time % 60)
-        
-        if hours > 0:
-            return f"{hours}h {minutes}m {seconds}s"
-        elif minutes > 0:
-            return f"{minutes}m {seconds}s"
-        else:
-            return f"{seconds}s"
     
     def _setup_cdo(self) -> Cdo:
         """Set up CDO with optimized performance settings."""
@@ -613,7 +547,7 @@ class CDORegridPipeline:
         - 'estimated_memory_gb': Estimated memory usage in GB
         - 'time_steps': Number of time steps
         """
-        # Check cache first
+        # check cache first
         if file_path in self._file_info_cache:
             return self._file_info_cache[file_path]
         
@@ -661,7 +595,7 @@ class CDORegridPipeline:
                 'time_steps': dims.get('time', 1),
             }
             
-            # Cache the result
+            # cache the result
             self._file_info_cache[file_path] = file_info
             return file_info
             
@@ -677,7 +611,7 @@ class CDORegridPipeline:
                 'estimated_memory_gb': 0.0,
                 'time_steps': None,
             }
-            # Cache the error result too to avoid repeated failures
+            # cache the error result too to avoid repeated failures
             self._file_info_cache[file_path] = error_info
             return error_info
     
@@ -727,17 +661,15 @@ class CDORegridPipeline:
         if not input_files:
             return None
             
-        # Try to find a file with nominal_resolution attribute
         for file_path in input_files:
             try:
                 with xa.open_dataset(file_path, decode_times=False) as ds:
-                    if 'nominal_resolution' in ds.attrs:
+                    if 'nominal_resolution' in ds.attrs:    # try to find a file with nominal_resolution attribute
                         return file_path
             except Exception:
                 continue
                 
-        # If no file has nominal_resolution, return the first file
-        return input_files[0]
+        return input_files[0]   # if no file has nominal_resolution, return the first file 
     
     def _calculate_target_resolution(self, input_file: Path) -> tuple[float, float]:
         """Calculate target resolution based on dataset's nominal_resolution attribute.
@@ -780,11 +712,11 @@ class CDORegridPipeline:
             representative_file (Path, optional): File to use for resolution calculation.
                                                  If None, uses the pipeline's target_resolution.
         """
-        # Try to calculate target resolution from a representative file
+        # try to calculate target resolution from a representative file
         if representative_file and representative_file.exists():
             lon_res, lat_res = self._calculate_target_resolution(representative_file)
             if lon_res == 9999.0 or lat_res == 9999.0:
-                # Fall back to pipeline's target resolution
+                # fall back to pipeline's target resolution
                 lon_res, lat_res = self.target_resolution
                 if self.verbose:
                     self.console.print(f"[yellow]Using pipeline target resolution: {lon_res}° x {lat_res}°[/yellow]")
@@ -792,10 +724,10 @@ class CDORegridPipeline:
                 if self.verbose:
                     self.console.print(f"[green]Calculated target resolution from {representative_file.name}: {lon_res:.3f}° x {lat_res:.3f}° (to 3 decimal places)[/green]")
         elif hasattr(self, '_representative_file') and self._representative_file and self._representative_file.exists():
-            # Use the pipeline's representative file
+            # use the pipeline's representative file
             lon_res, lat_res = self._calculate_target_resolution(self._representative_file)
             if lon_res == 9999.0 or lat_res == 9999.0:
-                # Fall back to pipeline's target resolution
+                # fall back to pipeline's target resolution
                 lon_res, lat_res = self.target_resolution
                 if self.verbose:
                     self.console.print(f"[yellow]Using pipeline target resolution: {lon_res}° x {lat_res}°[/yellow]")
@@ -803,13 +735,13 @@ class CDORegridPipeline:
                 if self.verbose:
                     self.console.print(f"[green]Calculated target resolution from {self._representative_file.name}: {lon_res}° x {lat_res}°[/green]")
         else:
-            # Use pipeline's target resolution
+            # use pipeline's target resolution
             lon_res, lat_res = self.target_resolution
             if self.verbose:
                 self.console.print(f"[blue]Using pipeline target resolution: {lon_res}° x {lat_res}°[/blue]")
         
         if self.target_grid == "lonlat":
-            # Regular lon/lat grid
+            # regular lon/lat grid
             xsize = int(360 / lon_res)
             ysize = int(180 / lat_res)
             xfirst = -180 + lon_res / 2 # TODO: check this logic
@@ -851,14 +783,23 @@ ysize = {ysize}"""
         
         Returns (list[Path]): List of paths to the chunked files
         """
+        ds = None
+        chunk_files = []
         try:
             ds = xa.open_dataset(file_path, decode_times=False)
             
-            if 'time' not in ds.dims or len(ds.time) <= chunk_size:
+            # Check if file has time dimension and enough time steps to chunk
+            if 'time' not in ds.dims:
+                self.logger.warning(f"File {file_path.name} has no 'time' dimension, skipping chunking")
                 return [file_path]
             
-            chunk_files = []
-            time_chunks = list(range(0, len(ds.time), chunk_size))
+            time_length = len(ds.time)
+            if time_length <= chunk_size:
+                if self.verbose:
+                    self.logger.debug(f"File {file_path.name} has {time_length} time steps (<= {chunk_size}), skipping chunking")
+                return [file_path]
+            
+            time_chunks = list(range(0, time_length, chunk_size))
             
             # Check if this is a prepared top_level file and extract base name
             is_top_level_file = '_top_level' in file_path.stem
@@ -869,24 +810,71 @@ ysize = {ysize}"""
             else:
                 chunk_stem_template = f"{file_path.stem}_chunk_{{i:03d}}"
             
+            # Create chunks
             for i, start_idx in enumerate(time_chunks):
-                end_idx = min(start_idx + chunk_size, len(ds.time))
+                end_idx = min(start_idx + chunk_size, time_length)
                 ds_chunk = ds.isel(time=slice(start_idx, end_idx))
                 
+                # Verify chunk has data before writing
+                if ds_chunk.sizes.get('time', 0) == 0:
+                    self.logger.warning(f"Skipping empty chunk {i} for {file_path.name}")
+                    continue
+                
                 chunk_path = file_path.parent / f"{chunk_stem_template.format(i=i)}{file_path.suffix}"
-                ds_chunk.to_netcdf(chunk_path)
                 
-                # Track the created chunk file for cleanup
-                self._track_created_file(chunk_path)
-                
-                chunk_files.append(chunk_path)
+                # Write chunk file
+                try:
+                    ds_chunk.to_netcdf(chunk_path)
+                    
+                    # Verify chunk file was created and is not empty
+                    if not chunk_path.exists() or chunk_path.stat().st_size == 0:
+                        self.logger.error(f"Chunk file {chunk_path.name} is empty or was not created")
+                        if chunk_path.exists():
+                            chunk_path.unlink()
+                        continue
+                    
+                    # Track the created chunk file for cleanup
+                    self._track_created_file(chunk_path)
+                    chunk_files.append(chunk_path)
+                    
+                except Exception as chunk_error:
+                    self.logger.error(f"Failed to write chunk {i} for {file_path.name}: {chunk_error}")
+                    # Clean up failed chunk file if it was partially created
+                    if chunk_path.exists():
+                        try:
+                            chunk_path.unlink()
+                        except Exception:
+                            pass
+                    raise  # Re-raise to trigger cleanup
+            
+            # If no chunks were created successfully, return original file
+            if not chunk_files:
+                self.logger.warning(f"No chunks created for {file_path.name}, returning original file")
+                return [file_path]
             
             return chunk_files
             
         except Exception as e:
             self.logger.error(f"Failed to chunk file {file_path}: {e}")
             self.logger.error(f"Full traceback: {traceback.format_exc()}")
+            
+            # Clean up any chunk files that were created before the error
+            for chunk_file in chunk_files:
+                try:
+                    if chunk_file.exists() and chunk_file != file_path:
+                        self.logger.warning(f"Cleaning up incomplete chunk file: {chunk_file.name}")
+                        chunk_file.unlink()
+                except Exception as cleanup_error:
+                    self.logger.error(f"Failed to clean up chunk file {chunk_file.name}: {cleanup_error}")
+            
             return [file_path]
+        finally:
+            # Always close the dataset if it was opened
+            if ds is not None:
+                try:
+                    ds.close()
+                except Exception:
+                    pass
     
     def _prepare_file_for_regridding(self, file_path: Path) -> Path:
         """
@@ -906,7 +894,6 @@ ysize = {ysize}"""
             ds = xa.open_dataset(file_path, decode_times=False)
             has_level, level_dims, level_count = self._whether_multi_level(dict(ds.sizes))
             
-            # Debug: Check if level_dims is actually a list
             if not isinstance(level_dims, list):
                 self.logger.error(f"level_dims is not a list: {type(level_dims)} = {level_dims}")
                 return file_path
@@ -915,17 +902,16 @@ ysize = {ysize}"""
                 return file_path
             
             # if multi-level, select top level. TODO: add seafloor fetching logic
-            # Find the first level dimension that exists in the dataset
             for dim in level_dims:
                 if dim in ds.dims:
-                    ds = ds.isel({dim: 0})
+                    ds = ds.isel({dim: 0})  # get the top level
                     break
             
             # save prepared file to same directory as original file
             prepared_path = file_path.parent / f"{file_path.stem}_top_level{file_path.suffix}"  # TODO: is this going to get confusing?
             ds.to_netcdf(prepared_path)
             
-            # Track the created file for cleanup
+            # track the created file for cleanup
             self._track_created_file(prepared_path)
             
             if self.verbose:
@@ -959,9 +945,7 @@ ysize = {ysize}"""
         Returns (bool): True if successful, False otherwise
         """
         try:
-            # get weight file path
             weight_path = self._get_weight_path(grid_signature)
-            # generate target grid description
             grid_desc = self._generate_target_grid_description(input_path)
             
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -978,16 +962,14 @@ ysize = {ysize}"""
                     chunk_output = tmpdir / f"chunk_{i:03d}.nc"
                     
                     if weight_path.exists():
-                        # use existing weights
-                        self._regrid_with_weights(chunk_file, chunk_output, grid_file, weight_path)
+                        self._regrid_with_weights(chunk_file, chunk_output, grid_file, weight_path)  # use existing weights to regrid
                     else:
-                        # generate weights and regrid
-                        self._regrid_without_weights(chunk_file, chunk_output, grid_file, grid_type)
+                        self._regrid_without_weights(chunk_file, chunk_output, grid_file, grid_type)  # generate weights and regrid
                         
                         # save weights for future use
                         if i == 0:  # only save weights from first chunk (chunked by time, therefore spatially identical)
                             # TODO: any issues if uneven number of time steps between chunks?
-                            self._save_weights(chunk_file, weight_path, grid_file, grid_type)
+                            self._save_weights(chunk_file, weight_path, grid_file)
                     
                     chunk_outputs.append(chunk_output)
                     self.stats['chunks_processed'] += 1
@@ -1000,14 +982,28 @@ ysize = {ysize}"""
                 
                 # clean up chunk files
                 for chunk_file in chunk_files:
-                    if chunk_file != input_path:
-                        chunk_file.unlink()
+                    if chunk_file != input_path and chunk_file.exists():
+                        try:
+                            chunk_file.unlink()
+                            self.logger.debug(f"Cleaned up chunk file: {chunk_file.name}")
+                        except Exception as cleanup_error:
+                            self.logger.warning(f"Failed to clean up chunk file {chunk_file.name}: {cleanup_error}")
                 
                 return True
                 
         except Exception as e:
             self.logger.error(f"Failed to regrid chunked file {input_path}: {e}")
             self.logger.error(f"Full traceback: {traceback.format_exc()}")
+            
+            # Clean up chunk files even if regridding failed
+            for chunk_file in chunk_files:
+                if chunk_file != input_path and chunk_file.exists():
+                    try:
+                        self.logger.warning(f"Cleaning up chunk file after error: {chunk_file.name}")
+                        chunk_file.unlink()
+                    except Exception as cleanup_error:
+                        self.logger.error(f"Failed to clean up chunk file {chunk_file.name}: {cleanup_error}")
+            
             return False
 
     def _combine_chunks(self, chunk_outputs: list[Path], output_path: Path):
@@ -1022,9 +1018,7 @@ ysize = {ysize}"""
         try:
             # load all chunks   # TODO: xa.open_mfdataset complains about dask not being installed
             datasets = [xa.open_dataset(chunk) for chunk in chunk_outputs]
-            # combine along time dimension
-            combined = xa.concat(datasets, dim='time')
-            # save combined dataset
+            combined = xa.concat(datasets, dim='time')  # combine along time dimension
             combined.to_netcdf(output_path)
             # close datasets to free memory
             for ds in datasets:
@@ -1058,39 +1052,13 @@ ysize = {ysize}"""
             return False
     
     def _regrid_without_weights(self, input_path: Path, output_path: Path, grid_file: Path, grid_type: str):
-        """Regrid without existing weights using appropriate method."""
-        try:    # TODO: why differentiating here?
-            if grid_type == 'unstructured_ncells':
-                # Use conservative remapping for unstructured grids
-                self.cdo.remapcon(
-                    str(grid_file),
-                    input=str(input_path),
-                    output=str(output_path),
-                )
-            elif grid_type == 'tripolar_ocean':
-                # Use conservative remapping for tri-polar ocean grids (similar to unstructured)
-                # Conservative remapping preserves mass/volume for ocean variables
-                self.cdo.remapcon(
-                    str(grid_file),
-                    input=str(input_path),
-                    output=str(output_path),
-                )
-            elif grid_type == 'curvilinear':
-                # Use bilinear remapping for curvilinear grids
-                self.cdo.remapbil(
-                    str(grid_file),
-                    input=str(input_path),
-                    output=str(output_path),
-                )
-            elif grid_type == 'structured':
-                # Use conservative remapping for structured grids
-                self.cdo.remapcon(
-                    str(grid_file),
-                    input=str(input_path),
-                    output=str(output_path),
-                )
-            else:
-                raise ValueError(f"Unsupported grid type: {grid_type}")
+        """Regrid without existing weights using appropriate method. Conservative remapping is used for all grid types to preserve mass/volume."""
+        try:
+            self.cdo.remapcon(
+                str(grid_file),
+                input=str(input_path),
+                output=str(output_path),
+            )
             return True
         except Exception as e:
             self.logger.error(f"Failed to regrid {input_path} of type {grid_type} without weights: {e}")
@@ -1144,7 +1112,7 @@ ysize = {ysize}"""
                     # regrid without weights
                     self._regrid_without_weights(input_path, output_path, grid_file, grid_type)
                     # save weights for future use
-                    self._save_weights(input_path, weight_path, grid_file, grid_type)
+                    self._save_weights(input_path, weight_path, grid_file)
                     self.stats['weights_generated'] += 1
                 
                 # verify output file exists and is not empty
@@ -1160,14 +1128,13 @@ ysize = {ysize}"""
             self.logger.error(f"Full traceback: {traceback.format_exc()}")
             return False
     
-    def _save_weights(self, input_path: Path, weight_path: Path, grid_file: Path, grid_type: str) -> None:
+    def _save_weights(self, input_path: Path, weight_path: Path, grid_file: Path) -> None:
         """Save regrid weights for future reuse with grid-type-specific method.
         
         Args:
         - input_path (Path): Path to the input file
         - weight_path (Path): Path to the weight file
         - grid_file (Path): Path to the grid file
-        - grid_type (str): Type of grid
         
         Returns (None): None
         """
@@ -1176,38 +1143,13 @@ ysize = {ysize}"""
                 tmpdir = Path(tmpdir)
                 temp_weights = tmpdir / "temp_weights.nc"
                 
-                # generate weights with appropriate method
-                if grid_type == 'unstructured_ncells':
-                    # use conservative weight generation for unstructured grids
-                    self.cdo.gencon(
-                        str(grid_file),
-                        input=str(input_path),
-                        output=str(temp_weights),
-                    )
-                elif grid_type == 'tripolar_ocean':
-                    # use conservative weight generation for tri-polar ocean grids
-                    # Conservative weights preserve mass/volume for ocean variables
-                    self.cdo.gencon(
-                        str(grid_file),
-                        input=str(input_path),
-                        output=str(temp_weights),
-                    )
-                elif grid_type == 'curvilinear':
-                    # use bilinear weight generation for curvilinear grids
-                    self.cdo.genbil(
-                        str(grid_file),
-                        input=str(input_path),
-                        output=str(temp_weights),
-                    )
-                else:
-                    # use conservative weight generation for structured grids
-                    self.cdo.gencon(
-                        str(grid_file),
-                        input=str(input_path),
-                        output=str(temp_weights),
-                    )
-                
-                # copy from tmpdir to weight_path, preserving metadata
+                self.cdo.gencon(
+                    str(grid_file),
+                    input=str(input_path),
+                    output=str(temp_weights),
+                )
+                    
+                # copy from tmpdir to weight_path, preserving dataset attributes
                 shutil.copy2(temp_weights, weight_path)
                 return True
         except Exception as e:
@@ -1239,21 +1181,17 @@ ysize = {ysize}"""
             self.logger.error(f"Full traceback: {traceback.format_exc()}")
             return False
         
-        # get file information
         file_info = self._get_file_info(input_path)
         
-        # start UI progress if provided
         if ui:
-            ui.start_file_processing(input_path, file_info)
+            ui.start_file_processing(input_path, file_info)  # start UI progress if provided
         
-        # determine output path
         if output_path is None:
             output_filename = self._generate_output_filename(input_path, file_info['has_level'], self.top_level_only)
-            output_path = input_path.parent / output_filename
+            output_path = input_path.parent / output_filename  # determine output path
         
-        # handle overwrite logic
         if output_path.exists():
-            if overwrite:
+            if overwrite:   # handle overwrite logic
                 if self.verbose:
                     self.console.print(f"[yellow]Overwriting existing file: {output_path.name}[/yellow]")
                 try:
@@ -1272,13 +1210,11 @@ ysize = {ysize}"""
         
         grid_type = file_info['grid_type']
         
-        # prepare file for regridding (select top level if needed)
-        if ui:
+        if ui:   # prepare file for regridding (select top level if needed)
             ui.update_file_progress(input_path, 10, "Preparing file")
         prepared_path = self._prepare_file_for_regridding(input_path)
         
-        # update statistics
-        self.stats['grid_types'][grid_type] += 1
+        self.stats['grid_types'][grid_type] += 1  # update statistics
         
         if self.verbose:
             self.console.print(f"[blue]Grid type: {grid_type}[/blue]")
@@ -1286,7 +1222,6 @@ ysize = {ysize}"""
             if file_info['has_level']:
                 self.console.print(f"[blue]Levels: {file_info['level_count']}[/blue]")
         
-        # check if we should chunk the file
         should_chunk = self._should_chunk_file(file_info)
         
         if should_chunk and self.verbose:
@@ -1296,11 +1231,9 @@ ysize = {ysize}"""
     
         
         try:
-            # get grid signature
             grid_signature = self._get_grid_signature(file_info)
             
-            if should_chunk:
-                # process in chunks
+            if should_chunk:   # check if we should chunk the file, if so, process in chunks
                 if ui:
                     ui.update_file_progress(input_path, 30, "Creating chunks")
                 chunk_files = self._chunk_file_by_time(prepared_path)
@@ -1313,8 +1246,7 @@ ysize = {ysize}"""
                     grid_type,
                     chunk_files,
                 )
-            else:
-                # process without chunking
+            else:   # process without chunking
                 if ui:
                     ui.update_file_progress(input_path, 30, "Regridding file")
                 success = self._regrid_single_file(
@@ -1334,16 +1266,14 @@ ysize = {ysize}"""
                     self.memory_monitor.update_peak()
                     self.stats['memory_peak_gb'] = self.memory_monitor.get_peak_memory_gb()
                 
-                # complete UI progress
-                if ui:
+                if ui:   # complete UI progress
                     ui.complete_file(input_path, success=True)
             else:
                 if ui:
                     ui.complete_file(input_path, success=False, message="Regridding failed")
             
-            # clean up prepared file if it was created
             if prepared_path != input_path and prepared_path.exists():
-                prepared_path.unlink()
+                prepared_path.unlink()  # clean up prepared file if it was created
             
             return success
             
@@ -1360,7 +1290,6 @@ ysize = {ysize}"""
         input_files: list[Path],
         output_dir: Optional[Path] = None,
         group_by_directory: bool = True,
-        prune_regridded: bool = True,
         overwrite: bool = False,
         use_ui: bool = True,
     ) -> dict[str, list[Path]]:
@@ -1370,10 +1299,11 @@ ysize = {ysize}"""
         - input_files (list[Path]): List of input files to regrid
         - output_dir (Path): Output directory. If None, outputs go to same directory as input
         - group_by_directory (bool): Group files by directory to maximize weight reuse
-        - prune_regridded (bool): Prune files with 'regridded' in the name to avoid processing them twice
         - overwrite (bool): If True, overwrite existing output files
         
         Returns (dict[str, list[Path]]): Dictionary mapping status to list of file paths
+        
+        Note: has two child functions, _regrid_batch_sequential and _regrid_batch_parallel depending on number of files, and whether parallel processing is enabled and is successful.
         """
         results = {
             'successful': [],
@@ -1385,60 +1315,64 @@ ysize = {ysize}"""
             input_files = [input_files]
             self.console.print(f"[yellow]Input is a single file, will be processed sequentially[/yellow]") if self.verbose else None
         
-        # Determine representative file for resolution calculation
+        # determine representative file for resolution calculation
         representative_file = self._get_representative_file(input_files)
         if representative_file and self.verbose:
             self.console.print(f"[blue]Using representative file for resolution calculation: {representative_file.name}[/blue]")
             
-        # Clean up problematic files (_top_level and _chunk_) first
+        # clean up problematic files (_top_level and _chunk_) first
         input_files = self._cleanup_problematic_files(input_files)
         
-        if prune_regridded:
-            if overwrite:
-                # unlink any files with 'regridded' in the name in order to reprocess them
-                for file in input_files:
-                    if 'regridded' in file.name:
-                        if self.verbose:
-                            self.console.print(f"[yellow]Removing existing regridded file: {file.name}[/yellow]")
-                        file.unlink()
-                # prune any files with 'regridded' in the name to avoid processing them twice
-                input_files = [file for file in input_files if 'regridded' not in file.name]
+        if overwrite:
+            # unlink any files with 'regridded' in the name in order to reprocess them
+            for file in input_files:
+                if 'regridded' in file.name:
+                    if self.verbose:
+                        self.console.print(f"[yellow]Removing existing regridded file: {file.name}[/yellow]")
+                    file.unlink()
+            # prune any files with 'regridded' in the name to avoid processing them twice
+            input_files = [
+                file for file in input_files
+                if 'regridded' not in file.name and not file.suffix.endswith('.part')
+            ]   # TODO: use _prune_regridded function instead (or remove it)
+            
+            # also check for and remove existing output files that would be created from input files
+            if self.verbose:
+                self.console.print(f"[blue]Checking for existing output files to remove (overwrite=True)[/blue]")
+            for file in input_files[:]:  # use slice copy to avoid modifying list while iterating
+                # generate the expected output filename using lightweight check
+                has_level = self._has_level_lightweight(file)
+                output_filename = self._generate_output_filename(file, has_level, self.top_level_only)
+                if output_dir:
+                    expected_output = output_dir / output_filename
+                else:
+                    expected_output = file.parent / output_filename
                 
-                # Also check for and remove existing output files that would be created from input files
-                if self.verbose:
-                    self.console.print(f"[blue]Checking for existing output files to remove (overwrite=True)[/blue]")
-                for file in input_files[:]:  # Use slice copy to avoid modifying list while iterating
-                    # Generate the expected output filename using lightweight check
-                    has_level = self._has_level_lightweight(file)
-                    output_filename = self._generate_output_filename(file, has_level, self.top_level_only)
-                    if output_dir:
-                        expected_output = output_dir / output_filename
-                    else:
-                        expected_output = file.parent / output_filename
-                    
-                    if expected_output.exists():
-                        if self.verbose:
-                            self.console.print(f"[yellow]Removing existing output file: {expected_output.name}[/yellow]")
-                        expected_output.unlink()
-            else:
-                # when overwrite=False, just prune from processing list but don't delete files
-                if self.verbose:
-                    regridded_files = [file for file in input_files if 'regridded' in file.name]
-                    if regridded_files:
-                        self.console.print(f"[blue]Skipping {len(regridded_files)} existing regridded files (overwrite=False)[/blue]")
-                input_files = [file for file in input_files if 'regridded' not in file.name]
+                if expected_output.exists():
+                    if self.verbose:
+                        self.console.print(f"[yellow]Removing existing output file: {expected_output.name}[/yellow]")
+                    expected_output.unlink()
+        else:
+            # when overwrite=False, just prune file names with 'regridded' in the name from processing list but don't delete them
+            if self.verbose:
+                regridded_files = [file for file in input_files if 'regridded' in file.name]
+                if regridded_files:
+                    self.console.print(f"[blue]Skipping {len(regridded_files)} existing regridded files (overwrite=False)[/blue]")
+            input_files = [
+                file for file in input_files
+                if 'regridded' not in file.name and not file.suffix.endswith('.part')
+            ]
         
-        # Start timing
-        self._start_timing()
+        self.start_time = fileops.print_timestamp(self.console, "START")
         
         if not self.enable_parallel or len(input_files) < 2 or self.max_workers in [None, 1]:
             # process sequentially
             results = self._regrid_batch_sequential(input_files, output_dir, group_by_directory, overwrite, use_ui)
-            self._end_timing()
+            self.end_time = fileops.print_timestamp(self.console, "END")
             return results
         
         try:
-            # Initialize compact UI for parallel processing
+            # initialize compact UI for parallel processing
             ui = None
             if use_ui and self.verbose:
                 ui = BatchRegridUI(input_files, max_workers=self.max_workers, verbose=self.verbose)
@@ -1488,7 +1422,7 @@ ysize = {ysize}"""
                     file_result = future.result()
                     completed += 1
                     
-                    # Update UI with result
+                    # update UI with result
                     if ui:
                         ui.update_file_result(file_result['file_path'], file_result)
                     
@@ -1524,16 +1458,16 @@ ysize = {ysize}"""
             self.logger.error(f"Full traceback: {traceback.format_exc()}")
             self.logger.warning(f"Falling back to sequential processing")
             results = self._regrid_batch_sequential(input_files, output_dir, group_by_directory, overwrite, use_ui)
-            self._end_timing()
+            self.end_time = fileops.print_timestamp(self.console, "END")
             return results
         finally:
             if ui:
                 # Add timing to stats
-                self.stats['processing_time'] = self.format_processing_time()
+                self.stats['processing_time'] = fileops.format_processing_time(fileops.get_processing_time(self.start_time, self.end_time))
                 ui._update_stats(self.stats)
                 ui.print_summary()
                 ui.__exit__(None, None, None)
-            self._end_timing()
+            self.end_time = fileops.print_timestamp(self.console, "END")
         
         return results
     
@@ -1553,6 +1487,8 @@ ysize = {ysize}"""
         - group_by_directory (bool): Group files by directory to maximize weight reuse
         
         Returns (dict[str, list[Path]]): Dictionary mapping status to list of file paths
+        
+        Note: has one regridding child function, regrid_file, for processing a single file.
         """
         results = {
             'successful': [],
@@ -1560,10 +1496,10 @@ ysize = {ysize}"""
             'skipped': [],
         }
         
-        # Clean up problematic files (_top_level and _chunk_) first
+        # clean up problematic files (_top_level and _chunk_) first
         input_files = self._cleanup_problematic_files(input_files)
         
-        # Initialize UI if requested
+        # initialize UI if requested
         ui = None
         if use_ui and self.verbose:
             ui = RegridProgressUI(input_files, verbose=self.verbose)
@@ -1622,8 +1558,7 @@ ysize = {ysize}"""
                         ui.complete_file(file_path, success=False, message=f"Error: {str(e)}")
         
         if ui:
-            # Add timing to stats
-            self.stats['processing_time'] = self.format_processing_time()
+            self.stats['processing_time'] = fileops.format_processing_time(fileops.get_processing_time(self.start_time, self.end_time))
             ui._update_stats(self.stats)
             ui.print_summary()
             ui.__exit__(None, None, None)
@@ -1898,29 +1833,30 @@ if __name__ == "__main__":
     parser.add_argument("--no-parallel", action="store_true", default=False, help="Disable parallel processing")
     parser.add_argument("--no-chunking", action="store_true", default=False, help="Disable chunked processing")
     parser.add_argument("--use-ui", action="store_true", default=True, help="Use UI for processing")
-    parser.add_argument("--cleanup", action="store_true", help="Clean up problematic files (_top_level, _chunk_) before processing")
+    # parser.add_argument("--cleanup", action="store_true", help="Clean up problematic files (*_top_level, *_chunk_*) before processing")
+    parser.add_argument("--unlink-unprocessed", action="store_true", default=False, help="Unlink unprocessed files after processing")
     
     args = parser.parse_args()
     
-    # Handle verbose/quiet logic
+    # handle verbose/quiet logic
     verbose = args.verbose and not args.quiet
     
-    # Handle cleanup if requested
-    if args.cleanup:
-        if args.input.is_file():
-            # Clean up in the same directory as the file
-            cleaned_count = cleanup_problematic_files(args.input.parent, verbose=verbose)
-        else:
-            # Clean up in the directory
-            cleaned_count = cleanup_problematic_files(args.input, verbose=verbose)
+    # # handle cleanup if requested
+    # if args.cleanup:
+    #     if args.input.is_file():
+    #         # clean up in the same directory as the file
+    #         cleaned_count = cleanup_problematic_files(args.input.parent, verbose=verbose)
+    #     else:
+    #         # clean up in the directory
+    #         cleaned_count = cleanup_problematic_files(args.input, verbose=verbose)
         
-        if cleaned_count == 0:
-            print("No problematic files found to clean up.")
-        else:
-            print(f"Cleaned up {cleaned_count} problematic files.")
+    #     if cleaned_count == 0:
+    #         print("No problematic files found to clean up.")
+    #     else:
+    #         print(f"Cleaned up {cleaned_count} problematic files.")
         
-        # Exit after cleanup
-        exit(0)
+    #     # exit after cleanup
+    #     exit(0)
     
     # determine if input is file or directory
     if args.input.is_file():
@@ -1958,3 +1894,91 @@ if __name__ == "__main__":
         console.print(f"\n[green]Successful: {len(results['successful'])}[/green]")
         console.print(f"[red]Failed: {len(results['failed'])}[/red]")
         console.print(f"[yellow]Skipped: {len(results['skipped'])}[/yellow]")
+
+
+# ================================
+# DEPRECATED FUNCTIONS
+# ================================
+    # def _start_timing(self):
+    #     """Start timing the processing."""
+    #     import time
+    #     self._start_time = time.time()
+    #     if self.verbose:
+    #         self.console.print(f"[blue]Processing started at {time.strftime('%H:%M:%S')}[/blue]")
+    
+    # def _end_timing(self):
+    #     """End timing the processing."""
+    #     import time
+    #     self.end_time = time.time()
+    #     if self.verbose:
+    #         self.console.print(f"[blue]Processing completed at {time.strftime('%H:%M:%S')}[/blue]")
+    
+    # def get_processing_time(self) -> Optional[float]:
+    #     """Get the total processing time in seconds."""
+    #     import time
+    #     if self._start_time is None:
+    #         return None
+    #     end_time = self.end_time if self.end_time is not None else time.time()
+    #     return end_time - self._start_time
+    
+    # def format_processing_time(self) -> str:
+    #     """Format processing time in a human-readable format."""
+    #     processing_time = self.get_processing_time()
+    #     if processing_time is None:
+    #         return "Timing not available"
+        
+    #     hours = int(processing_time // 3600)
+    #     minutes = int((processing_time % 3600) // 60)
+    #     seconds = int(processing_time % 60)
+        
+    #     if hours > 0:
+    #         return f"{hours}h {minutes}m {seconds}s"
+    #     elif minutes > 0:
+    #         return f"{minutes}m {seconds}s"
+    #     else:
+    #         return f"{seconds}s"
+    
+    
+    # def cleanup_problematic_files(directory: Path, verbose: bool = True) -> int:
+#     """
+#     Clean up problematic files (_top_level and _chunk_) in a directory.
+    
+#     Args:
+#         directory (Path): Directory to clean up
+#         verbose (bool): Whether to print verbose output
+        
+#     Returns:
+#         int: Number of files cleaned up
+#     """
+#     cleaned_count = 0
+    
+#     if verbose:
+#         console = Console()
+#         console.print(f"[blue]Cleaning up problematic files in: {directory}[/blue]")
+    
+#     # Find and remove _top_level files
+#     for file_path in directory.rglob("*_top_level.nc"):
+#         try:
+#             file_path.unlink()
+#             cleaned_count += 1
+#             if verbose:
+#                 console.print(f"[yellow]Removed: {file_path.name}[/yellow]")
+#         except Exception as e:
+#             if verbose:
+#                 console.print(f"[red]Could not remove {file_path.name}: {e}[/red]")
+    
+#     # Find and remove _chunk_ files
+#     for file_path in directory.rglob("*_chunk_*.nc"):
+#         try:
+#             file_path.unlink()
+#             cleaned_count += 1
+#             if verbose:
+#                 console.print(f"[yellow]Removed: {file_path.name}[/yellow]")
+#         except Exception as e:
+#             if verbose:
+#                 console.print(f"[red]Could not remove {file_path.name}: {e}[/red]")
+    
+#     if verbose:
+#         console.print(f"[green]Cleaned up {cleaned_count} problematic files[/green]")
+    
+#     return cleaned_count
