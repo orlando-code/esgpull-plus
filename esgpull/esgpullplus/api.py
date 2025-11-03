@@ -69,7 +69,7 @@ class EsgpullAPI:
     """
     Python API for interacting with esgpull, using the same logic as the CLI scripts.
     """
-
+    # TODO: look over distributed search logic
     def __init__(
         self,
         config_path: Optional[str | Path] = None,
@@ -81,6 +81,7 @@ class EsgpullAPI:
     def search(self, criteria: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
         Searches ESGF nodes for files/datasets matching the criteria.
+        Uses distributed search to query multiple nodes, with retry logic for 500 errors.
 
         Args:
             criteria (dict): A dictionary of search facets (e.g., project, variable).
@@ -95,19 +96,278 @@ class EsgpullAPI:
         tags = _criteria.pop("tags", [])
         # Remove filter key as it's not a search facet
         _criteria.pop("filter", None)
+        
+        # Try distributed search first (queries multiple nodes)
         query = parse_query(
             facets=[f"{k}:{v}" for k, v in _criteria.items()],
             tags=tags,
             require=None,
-            distrib=None,
+            distrib="true",  # Enable distributed search to query multiple nodes
             latest=None,
             replica=None,
             retracted=None,
         )
         query.compute_sha()
         self.esg.graph.resolve_require(query)
-        results = Context.search(query, file=True, max_hits=max_hits)
-        return [result.asdict() for result in results]
+        
+        try:
+            # Use a fresh EnhancedContext bound to a fresh OriginalContext to avoid event-loop/thread issues
+            from esgpull.esgpullplus.enhanced_context import EnhancedContext
+            from esgpull.context import Context as OriginalContext
+            local_original = OriginalContext(self.esg.config, noraise=True)
+            local_ctx = EnhancedContext()
+            local_ctx._original_context = local_original
+            results = local_ctx.search(query, file=True, max_hits=max_hits)
+            return [result.asdict() for result in results]
+        except Exception as e:
+            # If distributed search fails with 500 error, try alternative nodes
+            if self._is_server_error(e):
+                rich_print(
+                    "[yellow]⚠️  Distributed search failed with server error. "
+                    "Retrying with alternative ESGF nodes...[/yellow]"
+                )
+                return self._search_with_retry(_criteria, tags, max_hits)
+            raise
+    
+    def _is_server_error(self, exception: Exception) -> bool:
+        """Check if exception is a server error (500, 502, 503, etc.)."""
+        import httpx
+        if isinstance(exception, httpx.HTTPStatusError):
+            return exception.response.status_code >= 500
+        if isinstance(exception, BaseExceptionGroup):
+            return any(
+                isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code >= 500
+                for exc in exception.exceptions
+            )
+        return False
+    
+    def _search_with_retry(
+        self,
+        criteria: Dict[str, Any],
+        tags: list[str],
+        max_hits: Optional[int],
+    ) -> List[Dict[str, Any]]:
+        """
+        Retry search with alternative ESGF nodes when primary search fails.
+        
+        Args:
+            criteria: Search criteria
+            tags: Query tags
+            max_hits: Maximum number of results
+            
+        Returns:
+            List of search results
+        """
+        # List of alternative ESGF nodes to try
+        alternative_nodes = [
+            "esgf-data.dkrz.de",
+            "esgf.ceda.ac.uk",
+            "esgf-node.llnl.gov",
+            "esgf-node.ornl.gov",
+        ]
+        
+        # Try to fetch available nodes first
+        try:
+            available_nodes = self.esg.fetch_index_nodes()
+            # Filter to known reliable nodes
+            known_nodes = [
+                node for node in available_nodes
+                if any(alt in node for alt in alternative_nodes + ["ipsl", "dkrz", "ceda", "llnl", "ornl"])
+            ]
+            if known_nodes:
+                alternative_nodes = known_nodes[:5]  # Limit to top 5 nodes
+        except Exception:
+            # If we can't fetch nodes, use hardcoded list
+            pass
+        
+        query = parse_query(
+            facets=[f"{k}:{v}" for k, v in criteria.items()],
+            tags=tags,
+            require=None,
+            distrib="false",  # Try single node searches
+            latest=None,
+            replica=None,
+            retracted=None,
+        )
+        query.compute_sha()
+        self.esg.graph.resolve_require(query)
+        
+        # Try each alternative node (use fresh contexts per attempt to avoid event-loop/thread issues)
+        original_node = self.esg.config.api.index_node
+        results = None
+        
+        for node in alternative_nodes:
+            try:
+                rich_print(f"[blue]🔍 Trying ESGF node: {node}[/blue]")
+                # Build a fresh OriginalContext bound to this node (without mutating shared self.esg.context)
+                from esgpull.context import Context as OriginalContext
+                from esgpull.esgpullplus.enhanced_context import EnhancedContext
+                # Temporarily set node for creating the local context
+                self.esg.config.api.index_node = node
+                local_original = OriginalContext(self.esg.config, noraise=True)
+                local_ctx = EnhancedContext()
+                local_ctx._original_context = local_original
+                results = local_ctx.search(query, file=True, max_hits=max_hits)
+                rich_print(f"[green]✅ Successfully searched using node: {node}[/green]")
+                # Restore original node
+                self.esg.config.api.index_node = original_node
+                return [result.asdict() for result in results]
+                    
+            except Exception as node_error:
+                # Restore node before evaluating error
+                try:
+                    self.esg.config.api.index_node = original_node
+                except Exception:
+                    pass
+                
+                if self._is_server_error(node_error):
+                    rich_print(
+                        f"[yellow]⚠️  Node {node} also returned server error, trying next node...[/yellow]"
+                    )
+                    continue
+                else:
+                    # For non-server errors, still try to return results if available
+                    if results is not None:
+                        return [result.asdict() for result in results]
+                    # If no results, continue to next node
+                    rich_print(
+                        f"[yellow]⚠️  Node {node} returned error: {node_error}, trying next node...[/yellow]"
+                    )
+                    continue
+        
+        # If all nodes failed, raise the original error
+        raise RuntimeError(
+            f"All ESGF nodes failed. Tried: {', '.join(alternative_nodes)}. "
+            "This may be a temporary ESGF infrastructure issue."
+        )
+    
+    def find_alternative_files(
+        self,
+        failed_file: Dict[str, Any],
+        exclude_file_ids: Optional[list[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Find alternative files for a failed download by searching for files with the same
+        dataset characteristics but potentially different data nodes or versions.
+        
+        Args:
+            failed_file: Dictionary representation of the failed file
+            exclude_file_ids: List of file IDs to exclude from results (e.g., the failed file)
+            
+        Returns:
+            List of alternative file dictionaries, ordered by preference
+        """
+        if exclude_file_ids is None:
+            exclude_file_ids = []
+        
+        # Extract key identifying information from the failed file
+        search_criteria = {
+            "project": failed_file.get("project") or failed_file.get("mip_era", "CMIP6"),
+            "variable": failed_file.get("variable") or failed_file.get("variable_id"),
+            "experiment_id": failed_file.get("experiment_id"),
+            "frequency": failed_file.get("frequency") or failed_file.get("time_frequency"),
+        }
+        
+        # Remove None values
+        search_criteria = {k: v for k, v in search_criteria.items() if v is not None}
+        
+        if not search_criteria.get("variable"):
+            # Can't search without variable
+            return []
+        
+        rich_print(
+            f"[blue]🔍 Searching for alternative files for {failed_file.get('filename', 'unknown file')}...[/blue]"
+        )
+        
+        try:
+            # Search for alternatives using a fresh API/context to avoid event-loop/thread issues
+            alt_api = EsgpullAPI(verbosity=str(self.verbosity.name).lower()) if hasattr(self, 'verbosity') else EsgpullAPI()
+            alternatives = alt_api.search(search_criteria)
+            
+            # Filter alternatives
+            filtered_alternatives = []
+            failed_dataset_id = failed_file.get("dataset_id", "")
+            failed_instance_id = failed_file.get("instance_id", "")
+            failed_file_id = failed_file.get("file_id", "")
+            
+            for alt in alternatives:
+                alt_file_id = alt.get("file_id", "")
+                alt_dataset_id = alt.get("dataset_id", "")
+                
+                # Skip the original file and excluded files
+                if (alt_file_id == failed_file_id or 
+                    alt_file_id in exclude_file_ids or
+                    alt_dataset_id == failed_dataset_id):
+                    continue
+                
+                # Prefer files from different data nodes
+                failed_data_node = failed_file.get("data_node", "")
+                alt_data_node = alt.get("data_node", "")
+                
+                # Match key characteristics
+                if (alt.get("variable") == failed_file.get("variable") and
+                    alt.get("experiment_id") == failed_file.get("experiment_id") and
+                    alt.get("frequency") == failed_file.get("frequency")):
+                    
+                    # Score alternatives: prefer different data nodes, high resolution, then different versions
+                    from esgpull.esgpullplus import utils as search_utils
+                    
+                    score = 0
+                    
+                    # Strong preference for different data node (highest priority - try different node when one times out)
+                    if alt_data_node and alt_data_node != failed_data_node:
+                        score += 10000  # Strong preference for different data node
+                    
+                    # Prefer higher resolution files (maintains original search sorting preference)
+                    # Resolution values: smaller = higher resolution (better)
+                    failed_res = search_utils.calc_resolution(
+                        failed_file.get("nominal_resolution", "") or ""
+                    )
+                    alt_res = search_utils.calc_resolution(
+                        alt.get("nominal_resolution", "") or ""
+                    )
+                    
+                    # Score resolution: prefer same or better (smaller or equal) resolution
+                    if alt_res > 0 and failed_res > 0:
+                        if alt_res <= failed_res:
+                            # Same or better resolution: give bonus inversely proportional to resolution
+                            # Smaller resolution (higher quality) gets more points
+                            # Max bonus of 100 for very high resolution (very small value)
+                            score += max(0, 100 - alt_res * 10)
+                        else:
+                            # Lower resolution (larger value): give penalty
+                            # The worse the resolution, the larger the penalty
+                            score += max(0, 50 - (alt_res - failed_res) * 5)
+                    elif alt_res > 0 and failed_res >= 9999.0:
+                        # Failed file has no resolution info, but alternative does - prefer it
+                        score += 50
+                    
+                    # Small preference for different version (as tie-breaker)
+                    if alt.get("version") != failed_file.get("version"):
+                        score += 1
+                    
+                    filtered_alternatives.append((score, alt))
+            
+            # Sort by score (highest first) and return
+            filtered_alternatives.sort(key=lambda x: x[0], reverse=True)
+            result = [alt for _, alt in filtered_alternatives[:5]]  # Return top 5
+            
+            if result:
+                rich_print(
+                    f"[green]✅ Found {len(result)} alternative file(s) for {failed_file.get('filename', 'unknown')}[/green]"
+                )
+            else:
+                rich_print(
+                    f"[yellow]⚠️  No alternative files found for {failed_file.get('filename', 'unknown')}[/yellow]"
+                )
+            
+            return result
+            
+        except Exception as e:
+            rich_print(
+                f"[yellow]⚠️  Error searching for alternatives: {e}[/yellow]"
+            )
+            return []
 
 
     def add(self, criteria: Dict[str, Any], track: bool = False) -> None:
@@ -363,7 +623,11 @@ def search_and_download(search_criteria, meta_criteria, API=None):
     )
     
     # Check system resources before starting
-    output_dir = meta_criteria.get("output_dir", None)
+    if meta_criteria.get("test", True):
+        # output_dir = meta_criteria.get("output_dir", None)
+        output_dir = "test_downloads"
+    else:
+        output_dir = meta_criteria.get("output_dir", None)
     if output_dir:
         search_results.check_system_resources(output_dir)
     
@@ -405,6 +669,7 @@ def search_and_download(search_criteria, meta_criteria, API=None):
             rich_print(f"[blue]📦 Processing batch {batch_num + 1}/{total_batches} ({len(batch_files)} files)...[/blue]")
             
             try:
+                find_alternatives = meta_criteria.get("find_alternatives", True)
                 download_manager = download.DownloadSubset(
                     files=batch_files,
                     fs=API.esg.fs,
@@ -412,6 +677,8 @@ def search_and_download(search_criteria, meta_criteria, API=None):
                     subset=meta_criteria.get("subset"),
                     max_workers=meta_criteria.get("max_workers", 32),
                     verbose=meta_criteria.get("verbose", False),
+                    find_alternatives=find_alternatives,
+                    api_instance=API if find_alternatives else None,
                 )
 
                 # Pass shutdown event to download manager
