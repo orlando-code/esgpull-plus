@@ -6,6 +6,7 @@ from typing import Optional
 import pandas as pd
 from rich.console import Console
 from rich.panel import Panel
+import httpx
 
 # rich
 from rich.table import Table
@@ -52,7 +53,40 @@ class SearchResults:
         api_instance = api.EsgpullAPI()
         
         # Use enhanced search to get all available metadata
-        results = api_instance.search(criteria=self.search_criteria)
+        try:
+            results = api_instance.search(criteria=self.search_criteria)
+        except ExceptionGroup as eg:
+            # Handle ExceptionGroup from ESGF API errors
+            error_messages = []
+            for exc in eg.exceptions:
+                if isinstance(exc, httpx.HTTPStatusError):
+                    status_code = exc.response.status_code
+                    url = str(exc.request.url) if hasattr(exc, 'request') and exc.request else "unknown"
+                    error_messages.append(
+                        f"ESGF server error {status_code} for {url}. "
+                        f"This is a server-side issue at the ESGF node, not a problem with your search criteria."
+                    )
+                else:
+                    error_messages.append(str(exc))
+            
+            error_msg = "\n".join(error_messages)
+            raise RuntimeError(
+                f"Failed to search ESGF: {error_msg}\n"
+                f"Search criteria: {self.search_criteria}"
+            ) from eg
+        except httpx.HTTPStatusError as e:
+            status_code = e.response.status_code
+            url = str(e.request.url) if hasattr(e, 'request') and e.request else "unknown"
+            raise RuntimeError(
+                f"ESGF server error {status_code} for {url}. "
+                f"This is a server-side issue at the ESGF node, not a problem with your search criteria. "
+                f"Search criteria: {self.search_criteria}"
+            ) from e
+        except Exception as e:
+            raise RuntimeError(
+                f"Error during ESGF search: {e}\n"
+                f"Search criteria: {self.search_criteria}"
+            ) from e
         
         # Convert results to enhanced file dictionaries for future processing
         enhanced_results = []
@@ -267,7 +301,18 @@ class SearchResults:
         # if search results file not found, perform search and save
         except FileNotFoundError:
             self.search_message("pre")
-            self.do_search()
+            try:
+                self.do_search()
+            except RuntimeError as e:
+                # Re-raise API errors with clearer context
+                raise
+            except Exception as e:
+                # Catch any other unexpected errors during search
+                raise RuntimeError(
+                    f"Unexpected error during search: {e}\n"
+                    f"Search criteria: {self.search_criteria}"
+                ) from e
+            
             if self.results_df is not None and self.results_df.empty:
                 print("[SearchResults] No results found for given criteria.")
                 return []
