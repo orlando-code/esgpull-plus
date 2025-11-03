@@ -443,7 +443,7 @@ class BatchRegridUI:
             desc += f"[yellow]⏭{skipped}[/yellow] "
             desc += f"[red]✗{failed}[/red]"
             if remaining > 0:
-                desc += f" [blue]Remaining {remaining}[/blue]"
+                desc += f" [blue]Remaining: {remaining}[/blue]"
             
             self.progress.update(self.overall_progress, description=desc)
 
