@@ -6,6 +6,10 @@ from pathlib import Path
 # third-party
 import requests
 
+
+class _SkipFileError(Exception):
+    """Raised when a file should be skipped (e.g. empty URL), not failed."""
+
 # spatial
 import xarray as xa
 
@@ -22,6 +26,7 @@ class DownloadSubset:
         files,
         fs,
         output_dir=None,
+        data_dir=None,
         subset=None,
         max_workers=4,
         force_direct_download=False,
@@ -32,6 +37,7 @@ class DownloadSubset:
         self.files = files
         self.fs = fs
         self.output_dir = output_dir
+        self.data_dir = Path(data_dir) if data_dir else None
         self.subset = subset
         self.max_workers = max_workers if max_workers < len(files) else len(files)
         self.force_direct_download = force_direct_download
@@ -51,8 +57,9 @@ class DownloadSubset:
         """
         if self.output_dir:
             return Path(self.output_dir) / file.filename
-        else:
-            return self.fs.paths.data / file.local_path / file.filename
+        if self.data_dir:
+            return self.data_dir / file.local_path / file.filename
+        return self.fs.paths.data / file.local_path / file.filename
 
     def _file_exists(self, file: EnhancedFile) -> bool:
         """Check if the file exists on the file system.
@@ -63,8 +70,12 @@ class DownloadSubset:
         Returns:
             bool: True if the file exists, False otherwise
         """
+        # Need filename for downloads - dataset records don't have it
+        filename = getattr(file, "filename", "") or (file.get("filename", "") if isinstance(file, dict) else "")
+        if not (filename and str(filename).strip()):
+            return False  # Can't download without a filename
         file_path = self._get_file_path(file)
-        exists = file_path.exists() and file_path.stat().st_size > 0
+        exists = file_path.is_file() and file_path.stat().st_size > 0
         if not exists:
             self._remove_part_file_detritus(file) # remove any leftover .part files before attempting to download
         return exists
@@ -127,7 +138,12 @@ class DownloadSubset:
         """
         try:
             ui_instance.set_status(file, "STARTING", "cyan")
-            success = self._download_file_direct_ui(file, ui_instance)
+            try:
+                success = self._download_file_direct_ui(file, ui_instance)
+            except _SkipFileError as e:
+                ui_instance.set_status(file, "SKIPPED", "yellow")
+                ui_instance.complete_file(file)
+                return
             if success:
                 ui_instance.set_status(file, "DONE", "green")
                 ui_instance.complete_file(file)
@@ -157,6 +173,7 @@ class DownloadSubset:
             ui_instance.set_status(file, "TIMEOUT", "red")
             ui_instance.add_failed(file, f"Timeout: {timeout_error}", timeout_error)
             ui_instance.complete_file(file)
+            self.hide_file_after_delay(file, ui_instance, 5)
         except Exception as e:
             import traceback
             error_msg = f"Processing failed for {file.filename}: {e}"
@@ -355,6 +372,8 @@ class DownloadSubset:
 
         Returns (bool): True if the file was downloaded successfully, False otherwise
         """
+        timeout_connect = 60
+        timeout_read = 600 if (file.size or 0) > 10_000_000_000 else 300
         file_path = self._get_file_path(file)
         temp_path = file_path.with_suffix(file_path.suffix + ".part")
         
@@ -363,6 +382,10 @@ class DownloadSubset:
             time.sleep(2)
             if file_path.exists() and file_path.stat().st_size > 0:
                 return True
+        
+        # Skip files with empty or invalid URL - raise so caller marks as SKIPPED
+        if not file.url or not file.url.startswith("http"):
+            raise _SkipFileError(file, "Empty or invalid URL")
         
         file_path.parent.mkdir(parents=True, exist_ok=True)
         
@@ -383,11 +406,6 @@ class DownloadSubset:
                 headers = {}
                 if resume_position > 0:
                     headers['Range'] = f'bytes={resume_position}-'
-                
-                # Use longer timeout for large files - increase based on file size
-                # For very large files (>10GB), use longer timeout
-                timeout_connect = 10    # TODO: increase this post testing
-                timeout_read = 600 if (file.size or 0) > 10_000_000_000 else 300
                 
                 response = requests.get(
                     file.url,
