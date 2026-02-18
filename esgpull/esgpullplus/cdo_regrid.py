@@ -11,6 +11,7 @@ This module provides a complete regridding solution that:
 """
 
 import hashlib
+import os
 import tempfile
 import shutil
 import multiprocessing as mp
@@ -20,9 +21,9 @@ from typing import Optional
 import logging
 import traceback
 from concurrent.futures import ProcessPoolExecutor
+import numpy as np
 
 import time
-# import numpy as np
 import xarray as xa
 from cdo import Cdo
 from rich.console import Console
@@ -34,6 +35,58 @@ from rich.table import Table
 from esgpull.esgpullplus import utils, fileops
 from esgpull.esgpullplus.regrid_ui import RegridProgressUI, BatchRegridUI
 
+# Encoding keys accepted by xarray's netCDF4 backend (source files may use zstd/blosc/preferred_chunks etc.)
+_NC4_ENCODING_KEYS = frozenset({
+    "szip_pixels_per_block", "contiguous", "quantize_mode", "_FillValue", "fletcher32",
+    "endian", "chunksizes", "least_significant_digit", "complevel", "szip_coding",
+    "significant_digits", "dtype", "shuffle", "zlib", "blosc_shuffle", "compression",
+})
+
+
+# TODO
+# =====
+# [Errno 2] No such file or directory: 
+# '/maps/rt582/data/CMIP6/CMIP/AWI/AWI-CM-1-1-MR/historical/r3i1p1f1/Omon/so/gn/v20181218/so_Omon_AWI-CM-1-1-MR_historical_r3i1p1f1_gn_198101-199012_chunk_004.nc'
+# 2025-11-03 15:52:36,871 - cdo_regrid_132985047164560 - ERROR - Input file does not exist: 
+# /maps/rt582/data/CMIP6/CMIP/AWI/AWI-CM-1-1-MR/historical/r3i1p1f1/Omon/so/gn/v20181218/so_Omon_AWI-CM-1-1-MR_historical_r3i1p1f1_gn_198101-199012_chunk_004.nc
+# 2025-11-03 15:52:36,872 - cdo_regrid_132985047164560 - ERROR - Full traceback: NoneType: None
+
+# =====
+#  File "src/netCDF4/_netCDF4.pyx", line 2521, in netCDF4._netCDF4.Dataset.__init__
+#   File "src/netCDF4/_netCDF4.pyx", line 2158, in netCDF4._netCDF4._ensure_nc_success
+# FileNotFoundError: [Errno 2] No such file or directory: '/tmp/tmp_l7gazi6/chunk_001.nc'
+
+# 2025-11-03 16:00:02,286 - cdo_regrid_132985047169488 - ERROR - Chunk file so_Omon_AWI-CM-1-1-MR_historical_r3i1p1f1_gn_198101-199012_chunk_001.nc is empty or was not created
+
+
+def _process_chunk_standalone(args):
+    """Helper function to process a single chunk in parallel.
+    Must be at module level for ProcessPoolExecutor pickling.
+    
+    Args:
+        args: Tuple of (chunk_idx, chunk_file, tmpdir, grid_file, weight_path)
+    
+    Returns:
+        Tuple of (chunk_idx, chunk_output, success, error_message)
+    """
+    chunk_idx, chunk_file, tmpdir, grid_file, weight_path = args
+    chunk_output = Path(tmpdir) / f"chunk_{chunk_idx:03d}.nc"
+    try:
+        # Create a new CDO instance for this worker
+        from cdo import Cdo
+        cdo = Cdo()
+        
+        # Regrid using existing weights
+        cdo.remap(
+            str(grid_file),
+            str(weight_path),
+            input=str(chunk_file),
+            output=str(chunk_output),
+        )
+        return (chunk_idx, chunk_output, True, None)
+    except Exception as e:
+        return (chunk_idx, chunk_output, False, str(e))
+
 
 def _process_single_file_standalone(
     file_path: Path,
@@ -41,7 +94,10 @@ def _process_single_file_standalone(
     target_resolution: tuple[float, float],
     target_grid: str,
     weight_cache_dir: Path,
-    top_level_only: bool,
+    extract_surface: bool,
+    extract_seafloor: bool,
+    use_regrid_cache: bool,
+    use_seafloor_cache: bool,
     max_memory_gb: float,
     chunk_size_gb: float,
     enable_chunking: bool,
@@ -52,20 +108,23 @@ def _process_single_file_standalone(
     """
     Standalone function for processing a single file in parallel.
     Creates its own pipeline instance to avoid pickle issues.
-    
+
     Args:
     - file_path (Path): Path to the input file
     - output_dir (Optional[Path]): Output directory for regridded files
     - target_resolution (tuple[float, float]): Target resolution as (lon_res, lat_res)
     - target_grid (str): Target grid type ('lonlat', 'gaussian', etc.)
     - weight_cache_dir (Path): Directory to cache regrid weights
-    - top_level_only (bool): If True, only process the top level for multi-level files
+    - extract_surface (bool): If True, extract top level only and regrid that
+    - extract_seafloor (bool): If True, extract seafloor values and regrid only that
+    - use_regrid_cache (bool): If True, reuse existing regrid weight files
+    - use_seafloor_cache (bool): If True, reuse seafloor depth indices cache
     - max_memory_gb (float): Maximum memory usage in GB
     - chunk_size_gb (float): Maximum chunk size in GB
     - enable_chunking (bool): If True, chunk the file for processing
     - overwrite (bool): If True, overwrite existing output files
     - representative_file (Optional[Path]): Representative file for resolution calculation
-    
+
     Returns:
     - dict[str, any]: Dictionary containing the result of the regridding
         - 'success': Boolean indicating if the regridding was successful
@@ -91,7 +150,10 @@ def _process_single_file_standalone(
         target_resolution=target_resolution,
         target_grid=target_grid,
         weight_cache_dir=weight_cache_dir,
-        top_level_only=top_level_only,
+        extract_surface=extract_surface,
+        extract_seafloor=extract_seafloor,
+        use_regrid_cache=use_regrid_cache,
+        use_seafloor_cache=use_seafloor_cache,
         verbose=verbose,  # use the passed verbose parameter
         max_memory_gb=max_memory_gb,
         chunk_size_gb=chunk_size_gb,
@@ -109,10 +171,10 @@ def _process_single_file_standalone(
         has_level = pipeline._has_level_lightweight(file_path)
         # determine output path
         if output_dir:
-            output_filename = pipeline._generate_output_filename(file_path, has_level, top_level_only)
+            output_filename = pipeline._generate_output_filename(file_path, has_level, extract_surface, extract_seafloor)
             output_path = output_dir / output_filename
         else:
-            output_filename = pipeline._generate_output_filename(file_path, has_level, top_level_only)
+            output_filename = pipeline._generate_output_filename(file_path, has_level, extract_surface, extract_seafloor)
             output_path = file_path.parent / output_filename
         
         # check if output already exists (unless overwrite is True)
@@ -186,8 +248,12 @@ class CDORegridPipeline:
         target_resolution: tuple[float, float] = (1.0, 1.0),    # TODO: automate this based on native resolution of input file
         target_grid: str = "lonlat",
         weight_cache_dir: Optional[Path] = None,
-        top_level_only: bool = True,    # TODO: add seafloor option
+        extract_surface: bool = False,
+        extract_seafloor: bool = False,
+        use_regrid_cache: bool = True,
+        use_seafloor_cache: bool = True,
         verbose: bool = True,
+        verbose_diagnostics: bool = False,
         max_memory_gb: float = 8.0,
         max_workers: Optional[int] = 16,
         chunk_size_gb: float = 2.0,
@@ -198,14 +264,24 @@ class CDORegridPipeline:
     ):
         """
         Initialize the CDO regridding pipeline.
-        
+
+        Pipeline behaviour:
+        - If neither extract_surface nor extract_seafloor: regrid the whole file (use weight cache if use_regrid_cache).
+        - If extract_seafloor: identify seafloor indices (from cache if use_seafloor_cache), extract seafloor, regrid only that.
+        - If extract_surface: extract top level and regrid only that (use weight cache if use_regrid_cache).
+        - If both extract_surface and extract_seafloor: perform seafloor then surface sequentially (use regrid_single_file twice or regrid_single_file_extreme_levels).
+
         Parameters
         ----------
         target_resolution (tuple): Target resolution as (lon_res, lat_res) in degrees.
         target_grid (str): Target grid type ('lonlat', 'gaussian', etc.).
         weight_cache_dir (Path, optional): Directory to cache regrid weights.
-        top_level_only (bool): If True, only process the top level for multi-level files.
-        verbose (bool): Enable verbose output.
+        extract_surface (bool): If True, extract top level only and regrid that.
+        extract_seafloor (bool): If True, extract seafloor values (deepest non-NaN) and regrid only that.
+        use_regrid_cache (bool): If True, reuse existing regrid weight files when present.
+        use_seafloor_cache (bool): If True, reuse in-memory seafloor depth indices for files in the same directory.
+        verbose (bool): Enable verbose output (progress UI, etc.).
+        verbose_diagnostics (bool): If True, print Grid type, File size, Levels, Large file messages (max verbosity).
         max_memory_gb (float): Maximum memory usage in GB.
         max_workers (int, optional): Maximum number of parallel workers.
         chunk_size_gb (float): Maximum chunk size in GB for large files.
@@ -215,14 +291,22 @@ class CDORegridPipeline:
         """
         self.target_resolution = target_resolution
         self.target_grid = target_grid
-        self.top_level_only = top_level_only
+        self.extract_surface = extract_surface
+        self.extract_seafloor = extract_seafloor
+        self.use_regrid_cache = use_regrid_cache
+        self.use_seafloor_cache = use_seafloor_cache
         self.verbose = verbose
+        self.verbose_diagnostics = verbose_diagnostics
         self.max_memory_gb = max_memory_gb
         self.chunk_size_gb = chunk_size_gb
         self.enable_parallel = enable_parallel
         self.enable_chunking = enable_chunking
         self.memory_monitoring = memory_monitoring
         self.cleanup_weights = cleanup_weights
+        self.prune_regridded = True
+        
+        # Cache for seafloor depth indices per directory (for optimization)
+        self._seafloor_depth_cache: dict[str, dict[str, int]] = {}
                 
         # ensure not requesting more workers than available
         if max_workers is None:
@@ -275,8 +359,15 @@ class CDORegridPipeline:
         self._start_time: Optional[time.struct_time] = None
         self.end_time: Optional[time.struct_time] = None
         
+    def _get_target_variable(self, file_path: Path) -> str:
+        """Get the target variable for the file from the file_path. N.B. this is specific to CMIP data"""
+        return file_path.stem.split("_")[0]
+        
     def _prune_regridded(self, input_files: list[Path], overwrite: bool = False) -> list[Path]:
         """Prune files with 'regridded' in the name to avoid processing them twice."""
+        # ignore any files which have 'cdo_weights' as any parent directory
+        input_files = [file for file in input_files if 'cdo_weights' not in file.parents]
+        
         if self.prune_regridded:
             if overwrite:   # delete existing regridded files
                 for file in input_files:
@@ -398,7 +489,7 @@ class CDORegridPipeline:
             try:
                 if file_path.exists():
                     file_path.unlink()
-                    if self.verbose:
+                    if self.verbose_diagnostics:
                         self.logger.info(f"Cleaned up created file: {file_path.name}")
             except Exception as e:
                 self.logger.warning(f"Could not clean up {file_path}: {e}")
@@ -423,7 +514,6 @@ class CDORegridPipeline:
     
     def _setup_logger(self) -> logging.Logger:
         """Set up logging for the pipeline."""
-        # TODO: understand
         logger = logging.getLogger(f"cdo_regrid_{id(self)}")   # TODO: check that this functions for directories
         logger.setLevel(logging.INFO)
         
@@ -630,24 +720,30 @@ class CDORegridPipeline:
         """Get the path for regrid weights based on grid signature."""
         return self.weight_cache_dir / f"weights_{grid_signature}.nc"   # TODO: make sure this works for directories
     
-    def _generate_output_filename(self, input_path: Path, has_level: bool, top_level_only: bool = False) -> str:
+    def _generate_output_filename(
+        self,
+        input_path: Path,
+        has_level: bool,
+        extract_surface: bool = False,
+        extract_seafloor: bool = False,
+    ) -> str:
         """Generate output filename by modifying the input filename.
-        
+
         Args:
             input_path (Path): Path to the input file
-            top_level_only (bool): Whether the file was processed with top_level_only=True
-            
+            has_level (bool): Whether the source has a level/depth dimension
+            extract_surface (bool): Whether we extracted top level only
+            extract_seafloor (bool): Whether we extracted seafloor only
+
         Returns:
-            str: Generated output filename
+            str: Generated output filename (e.g. name_regridded.nc, name_top_level_regridded.nc, name_seafloor_regridded.nc)
         """
         name = input_path.name
-        
-        if top_level_only and '_top_level' not in name and has_level:
-            # insert _top_level before the extension
-            name = name.replace(input_path.suffix, '_top_level' + input_path.suffix)
-        
-        # insert _regridded before the extension
-        return name.replace(input_path.suffix, '_regridded' + input_path.suffix)
+        if extract_seafloor and "_seafloor" not in name:
+            name = name.replace(input_path.suffix, "_seafloor" + input_path.suffix)
+        if extract_surface and "_top_level" not in name and has_level:
+            name = name.replace(input_path.suffix, "_top_level" + input_path.suffix)
+        return name.replace(input_path.suffix, "_regridded" + input_path.suffix)
     
     def _get_representative_file(self, input_files: list[Path]) -> Optional[Path]:
         """Get a representative file from a list of files for resolution calculation.
@@ -689,7 +785,8 @@ class CDORegridPipeline:
                 
                 # get native resolution
                 native_res = ds.attrs['nominal_resolution']
-                self.logger.info(f"Found nominal_resolution: {native_res}")
+                if self.verbose_diagnostics:
+                    self.logger.info(f"Found nominal_resolution: {native_res}")
                 
                 # calculate target resolution
                 target_res = utils.calc_resolution(native_res)
@@ -718,10 +815,10 @@ class CDORegridPipeline:
             if lon_res == 9999.0 or lat_res == 9999.0:
                 # fall back to pipeline's target resolution
                 lon_res, lat_res = self.target_resolution
-                if self.verbose:
+                if self.verbose_diagnostics:
                     self.console.print(f"[yellow]Using pipeline target resolution: {lon_res}° x {lat_res}°[/yellow]")
             else:
-                if self.verbose:
+                if self.verbose_diagnostics:
                     self.console.print(f"[green]Calculated target resolution from {representative_file.name}: {lon_res:.3f}° x {lat_res:.3f}° (to 3 decimal places)[/green]")
         elif hasattr(self, '_representative_file') and self._representative_file and self._representative_file.exists():
             # use the pipeline's representative file
@@ -729,15 +826,15 @@ class CDORegridPipeline:
             if lon_res == 9999.0 or lat_res == 9999.0:
                 # fall back to pipeline's target resolution
                 lon_res, lat_res = self.target_resolution
-                if self.verbose:
+                if self.verbose_diagnostics:
                     self.console.print(f"[yellow]Using pipeline target resolution: {lon_res}° x {lat_res}°[/yellow]")
             else:
-                if self.verbose:
+                if self.verbose_diagnostics:
                     self.console.print(f"[green]Calculated target resolution from {self._representative_file.name}: {lon_res}° x {lat_res}°[/green]")
         else:
             # use pipeline's target resolution
             lon_res, lat_res = self.target_resolution
-            if self.verbose:
+            if self.verbose_diagnostics:
                 self.console.print(f"[blue]Using pipeline target resolution: {lon_res}° x {lat_res}°[/blue]")
         
         if self.target_grid == "lonlat":
@@ -809,6 +906,16 @@ ysize = {ysize}"""
                 chunk_stem_template = f"{base_stem}_chunk_{{i:03d}}_top_level"
             else:
                 chunk_stem_template = f"{file_path.stem}_chunk_{{i:03d}}"
+
+            # Encoding for chunk writes: preserve source encoding (netCDF4-compatible keys only) and avoid _FillValue on coords/bounds.
+            # Omit chunksizes so chunk time dimension (smaller than source) does not trigger "chunksize cannot exceed dimension size".
+            chunk_encoding = {}
+            for v in ds.variables:
+                raw = getattr(ds[v], "encoding", None) or {}
+                enc = {k: raw[k] for k in (raw if isinstance(raw, dict) else {}) if k in _NC4_ENCODING_KEYS and k != "chunksizes"}
+                chunk_encoding[v] = enc
+                if v in ds.coords or v in ("lat_bnds", "lon_bnds", "lat", "lon", "time", "time_bnds"):
+                    chunk_encoding[v]["_FillValue"] = None
             
             # Create chunks
             for i, start_idx in enumerate(time_chunks):
@@ -822,9 +929,9 @@ ysize = {ysize}"""
                 
                 chunk_path = file_path.parent / f"{chunk_stem_template.format(i=i)}{file_path.suffix}"
                 
-                # Write chunk file
+                # Write chunk file (same encoding as source so CDO accepts seafloor/top_level chunks)
                 try:
-                    ds_chunk.to_netcdf(chunk_path)
+                    ds_chunk.to_netcdf(chunk_path, encoding=chunk_encoding)
                     
                     # Verify chunk file was created and is not empty
                     if not chunk_path.exists() or chunk_path.stat().st_size == 0:
@@ -876,55 +983,298 @@ ysize = {ysize}"""
                 except Exception:
                     pass
     
-    def _prepare_file_for_regridding(self, file_path: Path) -> Path:
+    def _extract_seafloor_values(self, file_path: Path) -> Path:
         """
-        Prepare a file for regridding by selecting top level if needed.
+        Extract seafloor values (deepest non-NaN values along depth dimension) from a file.
+        Uses cached depth indices for files in the same directory for optimization.
         
-        Returns (Path): Path to prepared file.
-        """
-        if not self.top_level_only:
-            return file_path
-        
-        try:
-            # check if file has depth/level dimensions
-            # if has top_level in fp, just return the file
-            if '_top_level' in file_path.stem:
-                return file_path
+        Args:
+            file_path (Path): Path to the input file
             
+        Returns (Path): Path to the seafloor-extracted file
+        """
+        try:
+            # Write to a writable dir (temp if input dir is read-only)
+            out_dir = file_path.parent if os.access(file_path.parent, os.W_OK) else Path(tempfile.gettempdir())
+            seafloor_path = out_dir / f"{file_path.stem}_seafloor{file_path.suffix}"
+            if seafloor_path.exists():
+                # Validate existing file: re-extract if empty or no data vars (e.g. corrupt or from old code)
+                try:
+                    with xa.open_dataset(seafloor_path, decode_times=False) as existing:
+                        if existing.data_vars and all(existing.sizes.get(d, 0) > 0 for d in next(iter(existing.data_vars.values())).dims):
+                            if self.verbose:
+                                self.console.print(f"[cyan]Using existing seafloor file: {seafloor_path.name}[/cyan]")
+                            return seafloor_path
+                except Exception:
+                    pass
+                seafloor_path.unlink(missing_ok=True)
+                if self.verbose:
+                    self.console.print(f"[yellow]Re-extracting seafloor (existing file invalid or empty)[/yellow]")
+
+            target_variable = self._get_target_variable(file_path)
             ds = xa.open_dataset(file_path, decode_times=False)
             has_level, level_dims, level_count = self._whether_multi_level(dict(ds.sizes))
             
+            if not has_level or level_count == 0:
+                # No depth dimension, return original file
+                return file_path
+            
+            # Find the level dimension that exists in the dataset
+            level_dim = None
+            for dim in level_dims:
+                if dim in ds.dims:
+                    level_dim = dim
+                    break
+            
+            if level_dim is None:
+                return file_path
+
+
+            # Get or compute depth indices for this directory (use cache only if use_seafloor_cache)
+            dir_key = str(file_path.parent)
+            cache_key = f"{level_dim}_{ds.sizes[level_dim]}"
+            use_cache = self.use_seafloor_cache
+            if dir_key not in self._seafloor_depth_cache:
+                self._seafloor_depth_cache[dir_key] = {}
+            cache_hit = use_cache and (cache_key in self._seafloor_depth_cache[dir_key])
+
+            if not cache_hit:
+                # Compute seafloor depth indices: find deepest non-NaN value for each spatial location
+                if self.verbose:
+                    self.console.print(f"[blue]Computing seafloor depth indices for {file_path.name}...[/blue]")
+                
+                # Get a representative data variable that has the level dimension
+                # (exclude mesh/coord vars that may have only ncells, vertices)
+                data_vars_with_level = [
+                    v for v in ds.data_vars
+                    if level_dim in ds[v].dims
+                ]
+                if not data_vars_with_level:
+                    self.logger.warning(
+                        f"No data variables with level dimension '{level_dim}' in {file_path.name}"
+                    )
+                    ds.close()
+                    return file_path
+                # var_name = data_vars_with_level[0]  # TODO: surely this should be the target variable (ie uo)?
+                var_data = ds[target_variable]
+                # Take first time step only if the variable has a time dimension
+                if "time" in var_data.dims:
+                    var_data = var_data.isel(time=0)
+                
+                # Find deepest non-NaN index along level dimension
+                level_size = ds.sizes[level_dim]
+                
+                # Get spatial dimensions (all dims except level, time, bnds)
+                spatial_dims = [d for d in var_data.dims if d not in [level_dim, 'time', 'bnds']]   # with bnds was returning with a bnds coordinate. May be other rogue variables out there
+                
+                if spatial_dims:
+                    # For each spatial location, find deepest non-NaN value
+                    # Create a mask of valid (non-NaN) values using DataArray's isnull method
+                    valid_mask = ~var_data.isnull()
+                    
+                    # Check which locations have any valid values
+                    has_valid = valid_mask.any(dim=level_dim)
+                    
+                    # Find the deepest valid index for each spatial location
+                    # Reverse along level dimension and find first valid (which is deepest)
+                    # argmax returns index of first True (deepest valid)
+                    reversed_valid = valid_mask.isel({level_dim: slice(None, None, -1)})
+                    reversed_argmax = reversed_valid.argmax(dim=level_dim)
+                    
+                    # Convert back to original indexing (deepest = level_size - 1 - reversed_index)
+                    deepest_idx = level_size - 1 - reversed_argmax
+                    
+                    # Handle cases where all values are NaN (set to last index)
+                    # Also check if argmax returned 0 (which could mean all False or first is True)
+                    # If no valid values exist, argmax will return 0, but we need to check if that's valid
+                    all_nan_mask = ~has_valid
+                    # For locations with no valid values, use last index
+                    deepest_idx = deepest_idx.where(~all_nan_mask, level_size - 1)
+                    
+                    # Convert to numpy array for indexing
+                    depth_indices_array = deepest_idx.values
+                else:
+                    # No spatial dimensions (unlikely but handle it)
+                    # Just find deepest non-NaN across all data
+                    valid_mask = ~var_data.isnull()
+                    if valid_mask.any():
+                        # Find deepest valid index
+                        reversed_valid = valid_mask.isel({level_dim: slice(None, None, -1)})
+                        reversed_argmax = reversed_valid.argmax(dim=level_dim)
+                        deepest_idx = level_size - 1 - reversed_argmax
+                        depth_indices_array = int(deepest_idx.values) if hasattr(deepest_idx, 'values') else int(deepest_idx)
+                    else:
+                        # All NaN, use last index
+                        depth_indices_array = level_size - 1
+                
+                # Cache the depth indices
+                if use_cache:
+                    self._seafloor_depth_cache[dir_key][cache_key] = depth_indices_array
+                if self.verbose:
+                    self.console.print(f"[green]Computed seafloor depth indices[/green]" + (" (cached)" if use_cache else ""))
+            else:
+                # Use cached depth indices
+                depth_indices_array = self._seafloor_depth_cache[dir_key][cache_key]
+                if self.verbose:
+                    self.console.print(f"[cyan]Using cached seafloor depth indices[/cyan]")
+                # spatial_dims needed when depth_indices_array is an array; derive from first data var with level_dim
+                if not (isinstance(depth_indices_array, (int, np.integer)) or np.isscalar(depth_indices_array)):
+                    data_vars_with_level = [v for v in ds.data_vars if level_dim in ds[v].dims]
+                    if data_vars_with_level:
+                        spatial_dims = [d for d in ds[data_vars_with_level[0]].dims if d not in [level_dim, "time"]]
+                    else:
+                        spatial_dims = []
+
+            # Extract seafloor values using the depth indices
+            if self.verbose:
+                self.console.print(f"[blue]Extracting seafloor values from {file_path.name}...[/blue]")
+
+            # Create new dataset with seafloor values
+            seafloor_data_vars = {}
+            for var_name, var_data in ds.data_vars.items():
+                if level_dim in var_data.dims:
+                    # Extract values at seafloor depth indices
+                    if isinstance(depth_indices_array, (int, np.integer)) or np.isscalar(depth_indices_array):
+                        # Single index for all locations
+                        seafloor_data_vars[var_name] = var_data.isel({level_dim: int(depth_indices_array)})
+                    else:
+                        # Different indices for different spatial locations
+                        # Use xarray's advanced indexing with DataArray
+                        # Create a DataArray for the depth indices with matching spatial coordinates
+                        depth_idx_da = xa.DataArray(
+                            depth_indices_array,
+                            dims=spatial_dims,
+                            coords={d: var_data.coords[d] for d in spatial_dims if d in var_data.coords}
+                        )
+                        
+                        # Use isel with the DataArray for advanced indexing
+                        seafloor_data_vars[var_name] = var_data.isel({level_dim: depth_idx_da})
+                else:
+                    # Variable doesn't have level dimension, keep as is
+                    seafloor_data_vars[var_name] = var_data
+            
+            # Build coords without level_dim; omit lat_bnds/lon_bnds so CDO does not report "Inconsistent variable definition"
+            coords_seafloor = {k: v for k, v in ds.coords.items() if k != level_dim and k not in ("lat_bnds", "lon_bnds")}
+            seafloor_ds = xa.Dataset(
+                seafloor_data_vars,
+                coords=coords_seafloor,
+                attrs=ds.attrs
+            )
+            # Remove bounds attribute from lat/lon so the file does not reference missing bounds variables
+            for c in ("lat", "lon"):
+                if c in seafloor_ds.coords:
+                    seafloor_ds[c].attrs.pop("bounds", None)
+
+            # Encoding for seafloor write: only set _FillValue=None on coords so CDO accepts the file (CF compliant).
+            # Do not copy source encoding: it can contain backend-specific keys (zstd, blosc, preferred_chunks),
+            # or chunksizes that exceed seafloor dims (level dropped), causing "chunksize cannot exceed dimension size".
+            def _seafloor_encoding() -> dict:
+                enc = {}
+                for v in seafloor_ds.variables:
+                    enc[v] = {}
+                    if v in seafloor_ds.coords or v in ("lat", "lon", "time", "time_bnds"):
+                        enc[v]["_FillValue"] = None
+                return enc
+
+            try:
+                seafloor_ds.to_netcdf(seafloor_path, encoding=_seafloor_encoding())
+            except (ValueError, TypeError) as enc_err:
+                # If encoding still causes issues (e.g. netCDF4 backend change), retry with no encoding
+                self.logger.warning(f"Seafloor write with encoding failed ({enc_err}), retrying without encoding")
+                seafloor_ds.to_netcdf(seafloor_path)
+            ds.close()
+            seafloor_ds.close()
+            
+            # Track the created file for cleanup
+            self._track_created_file(seafloor_path)
+            
+            if self.verbose:
+                self.console.print(f"[green]Extracted seafloor values: {seafloor_path.name}[/green]")
+            
+            return seafloor_path
+            
+        except Exception as e:
+            self.logger.error(f"Failed to extract seafloor values from {file_path}: {e}")
+            self.logger.error(f"Full traceback: {traceback.format_exc()}")
+            # Return None or raise exception to indicate failure
+            # Returning original file_path would be misleading
+            raise RuntimeError(f"Seafloor extraction failed for {file_path.name}: {e}") from e
+    
+    def _prepare_file_for_regridding(self, file_path: Path) -> Path:
+        """
+        Prepare a file for regridding according to pipeline mode.
+
+        - If extract_seafloor: extract seafloor values (use seafloor cache if use_seafloor_cache), return path to seafloor file.
+        - If extract_surface: extract top level only, return path to top-level file.
+        - If neither: return file_path (regrid whole file).
+
+        Returns (Path): Path to prepared file (possibly a temporary/prepared NetCDF).
+        """
+        if self.extract_seafloor:
+            if "_seafloor" in file_path.stem:
+                return file_path
+            try:
+                prepared_path = self._extract_seafloor_values(file_path)
+                return prepared_path
+            except Exception as e:
+                self.logger.error(f"Seafloor extraction failed, cannot proceed with regridding: {e}")
+                raise
+
+        if not self.extract_surface:
+            return file_path
+
+        try:
+            if "_top_level" in file_path.stem:  # TODO: is top level always correct for the sea surface value?
+                return file_path
+            ds = xa.open_dataset(file_path, decode_times=False)
+            has_level, level_dims, level_count = self._whether_multi_level(dict(ds.sizes))
             if not isinstance(level_dims, list):
                 self.logger.error(f"level_dims is not a list: {type(level_dims)} = {level_dims}")
                 return file_path
-            
             if not has_level or level_count == 0:
                 return file_path
-            
-            # if multi-level, select top level. TODO: add seafloor fetching logic
             for dim in level_dims:
                 if dim in ds.dims:
-                    ds = ds.isel({dim: 0})  # get the top level
+                    ds = ds.isel({dim: 0})
                     break
-            
-            # save prepared file to same directory as original file
-            prepared_path = file_path.parent / f"{file_path.stem}_top_level{file_path.suffix}"  # TODO: is this going to get confusing?
+            # Write to a writable dir (temp if input dir is read-only)
+            prep_dir = file_path.parent if os.access(file_path.parent, os.W_OK) else Path(tempfile.gettempdir())
+            prepared_path = prep_dir / f"{file_path.stem}_top_level{file_path.suffix}"
             ds.to_netcdf(prepared_path)
-            
-            # track the created file for cleanup
             self._track_created_file(prepared_path)
-            
-            if self.verbose:
+            if self.verbose_diagnostics:
                 self.console.print(f"[cyan]Prepared file (top level): {prepared_path.name}[/cyan]")
                 self.logger.info(f"Prepared file (top level): {prepared_path.name}")
-            
             return prepared_path
-            
         except Exception as e:
             self.logger.warning(f"Could not prepare file {file_path}: {e}")
             self.logger.error(f"Full traceback: {traceback.format_exc()}")
             return file_path
-    
+
+    def _is_valid_prepared_file(self, prepared_path: Path) -> bool:
+        """Return False if prepared file is missing, empty, or has no data variables (CDO would fail)."""
+        if not prepared_path.exists():
+            self.logger.warning(f"Prepared file does not exist: {prepared_path}")
+            return False
+        if prepared_path.stat().st_size == 0:
+            self.logger.warning(
+                f"Prepared file is empty (0 bytes), skipping regridding: {prepared_path.name}"
+            )
+            return False
+        try:
+            with xa.open_dataset(prepared_path, decode_times=False) as ds:
+                if not ds.data_vars:
+                    self.logger.warning(
+                        f"Prepared file has no data variables, skipping regridding: {prepared_path.name}"
+                    )
+                    return False
+        except Exception as e:
+            self.logger.warning(
+                f"Prepared file could not be read or has unsupported structure: {prepared_path.name} ({e})"
+            )
+            return False
+        return True
+
     def _regrid_chunked_file(
         self,
         input_path: Path,
@@ -933,7 +1283,7 @@ ysize = {ysize}"""
         grid_type: str,
         chunk_files: list[Path],
     ) -> bool:
-        """Regrid a file that has been split into chunks.
+        """Regrid a file that has been split into chunks, with optional parallel processing.
         
         Args:
         - input_path (Path): Path to the input file
@@ -956,26 +1306,72 @@ ysize = {ysize}"""
                 with open(grid_file, 'w') as f:
                     f.write(grid_desc)
                 
-                # process each chunk
+                # Check if weights exist and we may use cache - if not, generate from first chunk
+                weights_exist = self.use_regrid_cache and weight_path.exists()
+                
+                if not weights_exist and len(chunk_files) > 0:
+                    # Process first chunk to generate weights
+                    if self.verbose_diagnostics:
+                        self.console.print(f"[blue]Generating weights from first chunk...[/blue]")
+                    first_chunk_output = tmpdir / "chunk_000.nc"
+                    self._regrid_without_weights(chunk_files[0], first_chunk_output, grid_file, grid_type)
+                    # Save weights for future use
+                    self._save_weights(chunk_files[0], weight_path, grid_file)
+                    weights_exist = True
+                    if self.verbose_diagnostics:
+                        self.console.print(f"[green]Weights generated and saved[/green]")
+                
+                # Process remaining chunks (in parallel if enabled)
                 chunk_outputs = []
-                for i, chunk_file in enumerate(chunk_files):
-                    chunk_output = tmpdir / f"chunk_{i:03d}.nc"
+                
+                if weights_exist and self.enable_parallel and len(chunk_files) > 1 and self.max_workers and self.max_workers > 1:
+                    # Parallel processing of chunks
+                    if self.verbose_diagnostics:
+                        self.console.print(f"[green]Processing {len(chunk_files)} chunks in parallel with {self.max_workers} workers[/green]")
                     
-                    if weight_path.exists():
-                        self._regrid_with_weights(chunk_file, chunk_output, grid_file, weight_path)  # use existing weights to regrid
-                    else:
-                        self._regrid_without_weights(chunk_file, chunk_output, grid_file, grid_type)  # generate weights and regrid
+                    # Prepare arguments for parallel processing
+                    chunk_args = [
+                        (i, chunk_file, str(tmpdir), str(grid_file), str(weight_path))
+                        for i, chunk_file in enumerate(chunk_files)
+                    ]
+                    
+                    # Process chunks in parallel
+                    chunk_results = []
+                    with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
+                        futures = [executor.submit(_process_chunk_standalone, args) for args in chunk_args]
+                        for future in futures:
+                            chunk_idx, chunk_output, success, error = future.result()
+                            if success:
+                                chunk_results.append((chunk_idx, Path(chunk_output)))
+                                self.stats['chunks_processed'] += 1
+                            else:
+                                self.logger.error(f"Failed to process chunk {chunk_idx}: {error}")
+                                return False
+                    
+                    # Sort by chunk index to maintain order
+                    chunk_results.sort(key=lambda x: x[0])
+                    chunk_outputs = [output for _, output in chunk_results]
+                    
+                else:
+                    # Sequential processing (fallback or if parallel disabled)
+                    if self.verbose_diagnostics and len(chunk_files) > 1:
+                        self.console.print(f"[yellow]Processing {len(chunk_files)} chunks sequentially[/yellow]")
+                    
+                    for i, chunk_file in enumerate(chunk_files):
+                        chunk_output = tmpdir / f"chunk_{i:03d}.nc"
                         
-                        # save weights for future use
-                        if i == 0:  # only save weights from first chunk (chunked by time, therefore spatially identical)
-                            # TODO: any issues if uneven number of time steps between chunks?
-                            self._save_weights(chunk_file, weight_path, grid_file)
-                    
-                    chunk_outputs.append(chunk_output)
-                    self.stats['chunks_processed'] += 1
+                        if weights_exist:
+                            self._regrid_with_weights(chunk_file, chunk_output, grid_file, weight_path)
+                        else:
+                            self._regrid_without_weights(chunk_file, chunk_output, grid_file, grid_type)
+                        
+                        chunk_outputs.append(chunk_output)
+                        self.stats['chunks_processed'] += 1
                 
                 # combine chunks into single file
                 if len(chunk_outputs) > 1:
+                    if self.verbose_diagnostics:
+                        self.console.print(f"[blue]Combining {len(chunk_outputs)} chunks...[/blue]")
                     self._combine_chunks(chunk_outputs, output_path)
                 else:
                     shutil.copy2(chunk_outputs[0], output_path)
@@ -985,9 +1381,9 @@ ysize = {ysize}"""
                     if chunk_file != input_path and chunk_file.exists():
                         try:
                             chunk_file.unlink()
-                            self.logger.debug(f"Cleaned up chunk file: {chunk_file.name}")
+                            self.console.print(f"[green]Cleaned up chunk file: {chunk_file.name}[/green]") if self.verbose_diagnostics else None
                         except Exception as cleanup_error:
-                            self.logger.warning(f"Failed to clean up chunk file {chunk_file.name}: {cleanup_error}")
+                            self.console.print(f"[red]Failed to clean up chunk file {chunk_file.name}: {cleanup_error}[/red]") if self.verbose_diagnostics else None
                 
                 return True
                 
@@ -1100,15 +1496,15 @@ ysize = {ysize}"""
                 with open(grid_file, 'w') as f:
                     f.write(grid_desc)
                 
-                # check to see whether we should reuse weights
-                if weight_path.exists() and not force_regenerate_weights:
-                    self.console.print(f"[green]Reusing weights: {weight_path.name}[/green]") if self.verbose else None
+                # check to see whether we should reuse weights (respect use_regrid_cache)
+                if self.use_regrid_cache and weight_path.exists() and not force_regenerate_weights:
+                    self.console.print(f"[green]Reusing weights: {weight_path.name}[/green]") if self.verbose_diagnostics else None
                     self.stats['weights_reused'] += 1
                     # use existing weights
                     self._regrid_with_weights(input_path, output_path, grid_file, weight_path)
                 else:
                     # generate new weights
-                    self.console.print(f"[yellow]Generating new weights: {weight_path.name}[/yellow]") if self.verbose else None
+                    self.console.print(f"[yellow]Generating new weights: {weight_path.name}[/yellow]") if self.verbose_diagnostics else None
                     # regrid without weights
                     self._regrid_without_weights(input_path, output_path, grid_file, grid_type)
                     # save weights for future use
@@ -1182,13 +1578,15 @@ ysize = {ysize}"""
             return False
         
         file_info = self._get_file_info(input_path)
-        
+        regrid_mode = "seafloor" if self.extract_seafloor else ("surface" if self.extract_surface else "complete")
         if ui:
-            ui.start_file_processing(input_path, file_info)  # start UI progress if provided
+            ui.start_file_processing(input_path, file_info, regrid_mode=regrid_mode)
         
         if output_path is None:
-            output_filename = self._generate_output_filename(input_path, file_info['has_level'], self.top_level_only)
-            output_path = input_path.parent / output_filename  # determine output path
+            output_filename = self._generate_output_filename(
+                input_path, file_info["has_level"], self.extract_surface, self.extract_seafloor
+            )
+            output_path = input_path.parent / output_filename
         
         if output_path.exists():
             if overwrite:   # handle overwrite logic
@@ -1208,37 +1606,57 @@ ysize = {ysize}"""
                     ui.skip_file(input_path, "File already exists")
                 return True
         
-        grid_type = file_info['grid_type']
-        
-        if ui:   # prepare file for regridding (select top level if needed)
-            ui.update_file_progress(input_path, 10, "Preparing file")
+        grid_type = file_info["grid_type"]
+
+        # Step description for progress UI
+        if self.extract_seafloor:
+            step_msg = "Extracting seafloor"
+        elif self.extract_surface:
+            step_msg = "Extracting surface (top level)"
+        else:
+            step_msg = "Regridding whole file"
+        if self.verbose and self.verbose_diagnostics:
+            self.console.print(Panel(f"[bold cyan]{step_msg}[/bold cyan]", style="dim"))
+        if ui:
+            ui.update_file_progress(input_path, 10, step_msg, regrid_mode=regrid_mode)
         prepared_path = self._prepare_file_for_regridding(input_path)
-        
-        self.stats['grid_types'][grid_type] += 1  # update statistics
-        
-        if self.verbose:
+
+        if not self._is_valid_prepared_file(prepared_path):
+            self.logger.error(
+                f"Skipping regridding: prepared file is empty or invalid (CDO would report 'No arrays found'): {prepared_path.name}"
+            )
+            if ui:
+                ui.complete_file(input_path, success=False, message="Prepared file empty or invalid")
+            return False
+
+        # Use prepared file's metadata for chunking/display (e.g. seafloor extract is single-level and smaller)
+        if prepared_path != input_path:
+            file_info = self._get_file_info(prepared_path)
+            grid_type = file_info['grid_type']
+
+        self.stats["grid_types"][grid_type] += 1
+
+        if self.verbose_diagnostics:
             self.console.print(f"[blue]Grid type: {grid_type}[/blue]")
             self.console.print(f"[blue]File size: {file_info['file_size_gb']:.2f} GB[/blue]")
-            if file_info['has_level']:
+            if file_info.get("has_level"):
                 self.console.print(f"[blue]Levels: {file_info['level_count']}[/blue]")
-        
+
         should_chunk = self._should_chunk_file(file_info)
-        
-        if should_chunk and self.verbose:
-            self.console.print(f"[yellow]Large file detected ({file_info['file_size_gb']:.2f} GB), using chunked processing[/yellow]")
-            if ui:
-                ui.update_file_progress(input_path, 20, "Chunking large file")
-    
-        
+        if should_chunk and self.verbose_diagnostics:
+            self.console.print(
+                f"[yellow]Large file detected ({file_info['file_size_gb']:.2f} GB), using chunked processing[/yellow]"
+            )
+        if should_chunk and ui:
+            ui.update_file_progress(input_path, 20, "Chunking large file", regrid_mode=regrid_mode)
         try:
             grid_signature = self._get_grid_signature(file_info)
-            
-            if should_chunk:   # check if we should chunk the file, if so, process in chunks
+            if should_chunk:
                 if ui:
-                    ui.update_file_progress(input_path, 30, "Creating chunks")
+                    ui.update_file_progress(input_path, 30, "Creating chunks", regrid_mode=regrid_mode)
                 chunk_files = self._chunk_file_by_time(prepared_path)
                 if ui:
-                    ui.update_file_progress(input_path, 50, "Regridding chunks")
+                    ui.update_file_progress(input_path, 50, "Regridding chunks", regrid_mode=regrid_mode)
                 success = self._regrid_chunked_file(
                     prepared_path,
                     output_path,
@@ -1246,15 +1664,16 @@ ysize = {ysize}"""
                     grid_type,
                     chunk_files,
                 )
-            else:   # process without chunking
+            else:
                 if ui:
-                    ui.update_file_progress(input_path, 30, "Regridding file")
+                    ui.update_file_progress(input_path, 30, "Regridding", regrid_mode=regrid_mode)
+                force_weights = force_regenerate_weights or not self.use_regrid_cache
                 success = self._regrid_single_file(
                     prepared_path,
                     output_path,
                     grid_signature,
                     grid_type,
-                    force_regenerate_weights,
+                    force_regenerate_weights=force_weights,
                 )
             
             if success:
@@ -1313,8 +1732,9 @@ ysize = {ysize}"""
         
         if isinstance(input_files, Path):
             input_files = [input_files]
-            self.console.print(f"[yellow]Input is a single file, will be processed sequentially[/yellow]") if self.verbose else None
-        
+            self.console.print(f"[yellow]Input is a single file, will be processed sequentially[/yellow]") if self.verbose_diagnostics else None
+        # Exclude weight/cache files from the batch
+        input_files = [f for f in input_files if not _is_weights_or_cache_file(f)]
         # determine representative file for resolution calculation
         representative_file = self._get_representative_file(input_files)
         if representative_file and self.verbose:
@@ -1342,7 +1762,9 @@ ysize = {ysize}"""
             for file in input_files[:]:  # use slice copy to avoid modifying list while iterating
                 # generate the expected output filename using lightweight check
                 has_level = self._has_level_lightweight(file)
-                output_filename = self._generate_output_filename(file, has_level, self.top_level_only)
+                output_filename = self._generate_output_filename(
+                    file, has_level, self.extract_surface, self.extract_seafloor
+                )
                 if output_dir:
                     expected_output = output_dir / output_filename
                 else:
@@ -1375,7 +1797,13 @@ ysize = {ysize}"""
             # initialize compact UI for parallel processing
             ui = None
             if use_ui and self.verbose:
-                ui = BatchRegridUI(input_files, max_workers=self.max_workers, verbose=self.verbose)
+                batch_mode = "seafloor" if self.extract_seafloor else ("surface" if self.extract_surface else "complete")
+                ui = BatchRegridUI(
+                    input_files,
+                    max_workers=self.max_workers,
+                    verbose=self.verbose,
+                    regrid_mode=batch_mode,
+                )
                 ui.__enter__()
             
             # process files in parallel (individual file processing)
@@ -1387,23 +1815,26 @@ ysize = {ysize}"""
                 
                 # submit each file individually for parallel processing
                 for file_path in input_files:
-                    # submit individual file for processing
-                    future = executor.submit(
-                        _process_single_file_standalone,
-                        file_path,
-                        output_dir,
-                        self.target_resolution,
-                        self.target_grid,
-                        self.weight_cache_dir,
-                        self.top_level_only,
-                        self.max_memory_gb,
-                        self.chunk_size_gb,
-                        self.enable_chunking,
-                        overwrite,
-                        representative_file,
-                        self.verbose,
-                    )
-                    futures.append(future)
+                        # submit individual file for processing
+                        future = executor.submit(
+                            _process_single_file_standalone,
+                            file_path,
+                            output_dir,
+                            self.target_resolution,
+                            self.target_grid,
+                            self.weight_cache_dir,
+                            self.extract_surface,
+                            self.extract_seafloor,
+                            self.use_regrid_cache,
+                            self.use_seafloor_cache,
+                            self.max_memory_gb,
+                            self.chunk_size_gb,
+                            self.enable_chunking,
+                            overwrite,
+                            representative_file,
+                            self.verbose,
+                        )
+                        futures.append(future)
                 
                 # collect results and combine statistics
                 completed = 0
@@ -1462,9 +1893,17 @@ ysize = {ysize}"""
             return results
         finally:
             if ui:
+                # print("here")
+                # print(self.stats)
                 # Add timing to stats
                 self.stats['processing_time'] = fileops.format_processing_time(fileops.get_processing_time(self.start_time, self.end_time))
+                print("here2")
+                print(self.stats)
+                print(type(self.stats['processing_time']))
+                
                 ui._update_stats(self.stats)
+                print("here5")
+                print(ui.stats)
                 ui.print_summary()
                 ui.__exit__(None, None, None)
             self.end_time = fileops.print_timestamp(self.console, "END")
@@ -1498,13 +1937,21 @@ ysize = {ysize}"""
         
         # clean up problematic files (_top_level and _chunk_) first
         input_files = self._cleanup_problematic_files(input_files)
+        # remove completed files from input_files (any containing 'regridded' in the name)
+        chunk_files = [file for file in input_files if 'chunk' in file.name]
+        regridded_files = [file for file in input_files if 'regridded' in file.name]
+        input_files = [file for file in input_files if file not in regridded_files]
+        # remove residual files (any containing 'chunk' in the name): TODO: these shouldn't exist at this point
+        input_files = [file for file in input_files if file not in chunk_files]
+        print(f"Removed {len(chunk_files)} and {len(regridded_files)} files from input_files before regridding")
         
         # initialize UI if requested
         ui = None
         if use_ui and self.verbose:
-            ui = RegridProgressUI(input_files, verbose=self.verbose)
+            ui = RegridProgressUI(
+                input_files, verbose=self.verbose, verbose_diagnostics=self.verbose_diagnostics
+            )
             ui.__enter__()
-        
         # group files by directory if requested
         if group_by_directory:
             file_groups = self._group_files_by_directory(input_files)
@@ -1525,15 +1972,19 @@ ysize = {ysize}"""
                     
                     # determine output path
                     if output_dir:
-                        output_filename = self._generate_output_filename(file_path, has_level, self.top_level_only)
+                        output_filename = self._generate_output_filename(
+                            file_path, has_level, self.extract_surface, self.extract_seafloor
+                        )
                         output_path = output_dir / output_filename
                     else:
-                        output_filename = self._generate_output_filename(file_path, has_level, self.top_level_only)
+                        output_filename = self._generate_output_filename(
+                            file_path, has_level, self.extract_surface, self.extract_seafloor
+                        )
                         output_path = file_path.parent / output_filename
-                    
+
                     # check if output already exists
                     if output_path.exists():
-                        results['skipped'].append(file_path)
+                        results["skipped"].append(file_path)
                         if self.verbose:
                             self.console.print(f"[yellow]Skipping (exists): {file_path.name}[/yellow]")
                         continue
@@ -1670,52 +2121,331 @@ class MemoryMonitor:
 # Convenience functions
 # ================================
 
+def extract_seafloor_single_file(
+    input_path: Path,
+    output_path: Optional[Path] = None,
+    verbose: bool = True,
+    overwrite: bool = False,
+) -> Path:
+    """
+    Convenience function to extract seafloor values from a single file.
+    
+    Args:
+    - input_path (Path): Path to input file
+    - output_path (Path): Path to output file (if None, auto-generates <filename>_seafloor.nc)
+    - verbose (bool): Enable verbose output
+    - overwrite (bool): If True, overwrite existing output files
+    
+    Returns (Path): Path to the seafloor-extracted file
+    
+    Raises:
+    - RuntimeError: If seafloor extraction fails
+    """
+    pipeline = CDORegridPipeline(
+        extract_seafloor=True,
+        verbose=verbose,
+    )
+    
+    if output_path is None:
+        output_path = input_path.parent / f"{input_path.stem}_seafloor{input_path.suffix}"
+    
+    if output_path.exists() and not overwrite:
+        if verbose:
+            pipeline.console.print(f"[yellow]Seafloor file already exists: {output_path.name}[/yellow]")
+        return output_path
+    
+    try:
+        seafloor_path = pipeline._extract_seafloor_values(input_path)
+        if verbose:
+            pipeline.console.print(f"[green]Seafloor file created: {seafloor_path}[/green]")
+        return seafloor_path
+    except Exception as e:
+        if verbose:
+            pipeline.console.print(f"[red]Failed to extract seafloor: {e}[/red]")
+        raise
+
+
 def regrid_single_file(
     input_path: Path,
     output_path: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
     target_resolution: tuple[float, float] = (1.0, 1.0),
-    top_level_only: bool = True,
+    extract_surface: bool = False,
+    extract_seafloor: bool = False,
+    use_regrid_cache: bool = True,
+    use_seafloor_cache: bool = True,
     verbose: bool = True,
+    verbose_diagnostics: bool = False,
     cleanup_weights: bool = False,
     overwrite: bool = False,
     use_ui: bool = True,
 ) -> bool:
     """
     Convenience function to regrid a single file.
-    
+
+    Pipeline: if neither extract_surface nor extract_seafloor, regrid whole file;
+    if extract_surface, extract top level and regrid; if extract_seafloor, extract
+    seafloor and regrid. For both surface and seafloor use regrid_single_file_extreme_levels.
+
     Args:
     - input_path (Path): Path to input file
     - output_path (Path): Path to output file
     - target_resolution (tuple): Target resolution as (lon_res, lat_res)
-    - top_level_only (bool): Only process top level for multi-level files
-    - verbose (bool): Enable verbose output
+    - extract_surface (bool): Extract top level only and regrid that
+    - extract_seafloor (bool): Extract seafloor values and regrid only that
+    - use_regrid_cache (bool): Reuse existing regrid weight files when present
+    - use_seafloor_cache (bool): Reuse seafloor depth indices cache
+    - verbose (bool): Enable verbose output (progress UI)
+    - verbose_diagnostics (bool): If True, print Grid type, File size, Large file (max verbosity)
     - cleanup_weights (bool): Clean up weights after processing
     - overwrite (bool): If True, overwrite existing output files
-    
+    - use_ui (bool): Use rich progress UI
+
     Returns (bool): True if successful, False otherwise
     """
     pipeline = CDORegridPipeline(
         target_resolution=target_resolution,
-        top_level_only=top_level_only,
+        extract_surface=extract_surface,
+        extract_seafloor=extract_seafloor,
+        use_regrid_cache=use_regrid_cache,
+        use_seafloor_cache=use_seafloor_cache,
         verbose=verbose,
+        verbose_diagnostics=verbose_diagnostics,
         cleanup_weights=cleanup_weights,
     )
-    
+    if output_dir is not None and output_path is None:
+        has_level = pipeline._has_level_lightweight(input_path)
+        filename = pipeline._generate_output_filename(
+            input_path, has_level, extract_surface, extract_seafloor
+        )
+        output_path = output_dir / filename
     # Initialize UI if requested
     ui = None
     if use_ui and verbose:
-        ui = RegridProgressUI([input_path], verbose=verbose)
+        ui = RegridProgressUI(
+            [input_path],
+            verbose=verbose,
+            verbose_diagnostics=pipeline.verbose_diagnostics,
+        )
         ui.__enter__()
-    
+    # Track processing time
+    import time
+    start_time = fileops.print_timestamp(pipeline.console, "START") if verbose else time.localtime()
     try:
-        return pipeline.regrid_file(input_path, output_path, overwrite=overwrite, ui=ui)
+        result = pipeline.regrid_file(input_path, output_path, overwrite=overwrite, ui=ui)
+        return result
     finally:
         if ui:
             # Add timing to stats
-            pipeline.stats['processing_time'] = pipeline.format_processing_time()
+            end_time = fileops.print_timestamp(pipeline.console, "END") if verbose else time.localtime()
+            pipeline.stats['processing_time'] = fileops.format_processing_time(
+                fileops.get_processing_time(start_time, end_time)
+            )
             ui._update_stats(pipeline.stats)
             ui.print_summary()
             ui.__exit__(None, None, None)
+
+
+def regrid_single_file_both_levels(
+    input_path: Path,
+    output_dir: Optional[Path] = None,
+    target_resolution: tuple[float, float] = (1.0, 1.0),
+    use_regrid_cache: bool = True,
+    use_seafloor_cache: bool = True,
+    verbose: bool = True,
+    cleanup_weights: bool = False,
+    overwrite: bool = False,
+    weight_cache_dir: Optional[Path] = None,
+) -> dict[str, bool]:
+    """
+    Regrid both the top level (surface) and the seafloor values for a single file.
+
+    Performs steps 2 and 3 sequentially: seafloor extraction+regrid, then surface extraction+regrid.
+    Outputs: ``<name>_seafloor_regridded.nc`` and ``<name>_top_level_regridded.nc`` (if multi-level).
+
+    Parameters
+    ----------
+    input_path : Path
+        Input NetCDF file.
+    output_dir : Path, optional
+        Directory for regridded outputs. If ``None``, files are written next to ``input_path``.
+    target_resolution : tuple[float, float]
+        Target grid resolution.
+    use_regrid_cache : bool
+        Reuse existing regrid weight files when present.
+    use_seafloor_cache : bool
+        Reuse seafloor depth indices cache.
+    verbose : bool
+        Enable verbose logging.
+    cleanup_weights : bool
+        Clean up weights after processing.
+    overwrite : bool
+        Overwrite existing outputs.
+    weight_cache_dir : Path, optional
+        Directory for regrid weight cache. If None, uses cwd / "cdo_weights".
+
+    Returns
+    -------
+    dict[str, bool]
+        Mapping ``{'top_level': bool, 'seafloor': bool}`` indicating success for each stream.
+    """
+    # 1) Seafloor: extract seafloor indices (from file or cache), extract values, regrid
+    seafloor_pipeline = CDORegridPipeline(
+        target_resolution=target_resolution,
+        extract_surface=False,
+        extract_seafloor=True,
+        use_regrid_cache=use_regrid_cache,
+        use_seafloor_cache=use_seafloor_cache,
+        verbose=verbose,
+        cleanup_weights=cleanup_weights,
+        weight_cache_dir=weight_cache_dir,
+    )
+    if overwrite:
+        seafloor_intermediate = input_path.parent / f"{input_path.stem}_seafloor{input_path.suffix}"
+        if seafloor_intermediate.exists():
+            seafloor_intermediate.unlink()
+    seafloor_success = seafloor_pipeline.regrid_file(
+        input_path=input_path,
+        output_path=output_dir,
+        overwrite=overwrite,
+        ui=None,
+    )
+
+    # 2) Surface: extract top level and regrid
+    top_pipeline = CDORegridPipeline(
+        target_resolution=target_resolution,
+        extract_surface=True,
+        extract_seafloor=False,
+        use_regrid_cache=use_regrid_cache,
+        use_seafloor_cache=use_seafloor_cache,
+        verbose=verbose,
+        cleanup_weights=cleanup_weights,
+        weight_cache_dir=weight_cache_dir,
+    )
+    top_success = top_pipeline.regrid_file(
+        input_path=input_path,
+        output_path=output_dir,
+        overwrite=overwrite,
+        ui=None,
+    )
+
+    return {"top_level": top_success, "seafloor": seafloor_success}
+
+
+# Alias for CLI --extreme-levels
+regrid_single_file_extreme_levels = regrid_single_file_both_levels
+
+
+def process_directory_both_levels(
+    dir_path: Path,
+    file_list: list[Path],
+    output_dir: Optional[Path] = None,
+    target_resolution: tuple[float, float] = (1.0, 1.0),
+    use_regrid_cache: bool = True,
+    use_seafloor_cache: bool = True,
+    verbose: bool = True,
+    overwrite: bool = False,
+) -> list[tuple[Path, dict[str, bool]]]:
+    """
+    Process all files in one directory with shared pipelines (seafloor cache + weight cache).
+    Per file: seafloor then surface (extreme levels). Call from a single worker per directory.
+    """
+    weight_cache_dir = dir_path / "cdo_weights"
+    seafloor_pipeline = CDORegridPipeline(
+        target_resolution=target_resolution,
+        extract_surface=False,
+        extract_seafloor=True,
+        use_regrid_cache=use_regrid_cache,
+        use_seafloor_cache=use_seafloor_cache,
+        verbose=verbose,
+        cleanup_weights=False,
+        weight_cache_dir=weight_cache_dir,
+    )
+    top_pipeline = CDORegridPipeline(
+        target_resolution=target_resolution,
+        extract_surface=True,
+        extract_seafloor=False,
+        use_regrid_cache=use_regrid_cache,
+        use_seafloor_cache=use_seafloor_cache,
+        verbose=verbose,
+        cleanup_weights=False,
+        weight_cache_dir=weight_cache_dir,
+    )
+    results: list[tuple[Path, dict[str, bool]]] = []
+    for fp in file_list:
+        seafloor_ok = seafloor_pipeline.regrid_file(
+            input_path=fp,
+            output_path=output_dir,
+            overwrite=overwrite,
+            ui=None,
+        )
+        top_ok = top_pipeline.regrid_file(
+            input_path=fp,
+            output_path=output_dir,
+            overwrite=overwrite,
+            ui=None,
+        )
+        results.append((fp, {"top_level": top_ok, "seafloor": seafloor_ok}))
+    return results
+
+
+def _worker_process_directory_both_levels(
+    args: tuple,
+) -> list[tuple[Path, dict[str, bool]]]:
+    """Picklable worker: process one directory (all files sequentially) with shared pipelines."""
+    dir_path, file_list, output_dir, target_resolution, verbose, overwrite = args
+    return process_directory_both_levels(
+        dir_path=dir_path,
+        file_list=file_list,
+        output_dir=output_dir,
+        target_resolution=target_resolution,
+        verbose=verbose,
+        overwrite=overwrite,
+    )
+
+
+def _worker_both_levels(
+    args: tuple,
+) -> tuple[Path, dict[str, bool]]:
+    """Picklable worker for regrid_single_file_both_levels. Used by ProcessPoolExecutor.
+    Uses a per-process weight cache dir to avoid races on weight generation/reuse.
+    Seafloor depth cache is in-memory per pipeline, so no cross-process conflict.
+    """
+    input_path, output_dir, target_resolution, verbose, overwrite = args
+    # Per-process weight dir so parallel workers don't share weight files (avoid races)
+    weight_cache_dir = Path(tempfile.gettempdir()) / f"cdo_weights_{os.getpid()}"
+    status = regrid_single_file_both_levels(
+        input_path=input_path,
+        output_dir=output_dir,
+        target_resolution=target_resolution,
+        verbose=verbose,
+        cleanup_weights=False,
+        overwrite=overwrite,
+        weight_cache_dir=weight_cache_dir,
+    )
+    return (input_path, status)
+
+
+def _is_weights_or_cache_file(path: Path) -> bool:
+    """Return True if path is a weight file or under a weight cache directory (exclude from regrid list)."""
+    if path.stem.lower().startswith("weights_"):
+        return True
+    if "cdo_weights" in path.parts:
+        return True
+    return False
+
+
+def _is_intermediate_nc(path: Path) -> bool:
+    """Return True if path is an intermediate/product we should not regrid (top_level, regridded, seafloor, chunk, weights)."""
+    if _is_weights_or_cache_file(path):
+        return True
+    stem = path.stem.lower()
+    return (
+        "_top_level" in stem
+        or "_regridded" in stem
+        or "_seafloor" in stem
+        or "_chunk_" in stem
+    )
 
 
 def regrid_directory(
@@ -1724,8 +2454,12 @@ def regrid_directory(
     output_dir: Optional[Path] = None,
     target_resolution: tuple[float, float] = None,
     file_pattern: str = "*.nc",
-    top_level_only: bool = True,
+    extract_surface: bool = False,
+    extract_seafloor: bool = False,
+    use_regrid_cache: bool = True,
+    use_seafloor_cache: bool = True,
     verbose: bool = True,
+    verbose_diagnostics: bool = False,
     max_workers: Optional[int] = 4,
     enable_parallel: bool = True,
     overwrite: bool = False,
@@ -1733,35 +2467,45 @@ def regrid_directory(
 ) -> dict[str, list[Path]]:
     """
     Convenience function to regrid all files in a directory.
-    
+
     Args:
     - input_dir (Path): Input directory containing NetCDF files
     - output_dir (Path): Output directory for regridded files
     - target_resolution (tuple): Target resolution as (lon_res, lat_res)
     - file_pattern (str): File pattern to match (e.g., "*.nc", "*.nc4")
-    - top_level_only (bool): Only process top level for multi-level files
-    - verbose (bool): Enable verbose output
+    - extract_surface (bool): Extract top level only and regrid that
+    - extract_seafloor (bool): Extract seafloor values and regrid only that
+    - use_regrid_cache (bool): Reuse existing regrid weight files
+    - use_seafloor_cache (bool): Reuse seafloor depth indices cache
+    - verbose (bool): Enable verbose output (progress UI)
+    - verbose_diagnostics (bool): If True, print Grid type, File size, Large file (max verbosity)
     - max_workers (int): Maximum number of parallel workers
     - enable_parallel (bool): Enable parallel processing
     - overwrite (bool): If True, overwrite existing output files
-    
+    - use_ui (bool): Use rich progress UI
+
     Returns (dict[str, list[Path]]): Dictionary mapping status to list of file paths
     """
-    # find all matching files
+    # find all matching files (exclude intermediates: _top_level, _regridded, _seafloor, _chunk_)
     if include_subdirectories:
-        input_files = list(input_dir.rglob(file_pattern))
+        raw = list(input_dir.rglob(file_pattern))
     else:
-        input_files = list(input_dir.glob(file_pattern))
-    
+        raw = list(input_dir.glob(file_pattern))
+    input_files = [p for p in raw if not _is_intermediate_nc(p)]
+
     if not input_files:
         print(f"No files found matching pattern '{file_pattern}' in {input_dir}")
-        return {'successful': [], 'failed': [], 'skipped': []}
-    
+        return {"successful": [], "failed": [], "skipped": []}
+
     # create pipeline
     pipeline = CDORegridPipeline(
         target_resolution=target_resolution,
-        top_level_only=top_level_only,
+        extract_surface=extract_surface,
+        extract_seafloor=extract_seafloor,
+        use_regrid_cache=use_regrid_cache,
+        use_seafloor_cache=use_seafloor_cache,
         verbose=verbose,
+        verbose_diagnostics=verbose_diagnostics,
         max_workers=max_workers,
         enable_parallel=enable_parallel,
     )
@@ -1773,6 +2517,128 @@ def regrid_directory(
     
     return results
 
+
+def regrid_directory_both_levels(
+    input_dir: Path,
+    include_subdirectories: bool = False,
+    output_dir: Optional[Path] = None,
+    target_resolution: tuple[float, float] = (1.0, 1.0),
+    file_pattern: str = "*.nc",
+    verbose: bool = True,
+    overwrite: bool = False,
+    max_workers: Optional[int] = 4,
+    enable_parallel: bool = True,
+) -> dict[str, list[Path]]:
+    """
+    Regrid both the top level and the seafloor values for all files
+    in a directory.
+
+    This is a higher-level orchestrator that calls
+    :func:`regrid_single_file_both_levels` for each matching file and
+    aggregates the results into the same status dictionary structure
+    as :func:`regrid_directory`.     When ``enable_parallel`` is True and there are multiple directories, directories
+    are processed in parallel (one worker per directory). Within each directory
+    all files are processed sequentially with shared pipelines, so per-directory
+    seafloor depth cache and weight cache (``<dir>/cdo_weights``) are reused and
+    no workers contend for the same directory.
+
+    Parameters
+    ----------
+    input_dir : Path
+        Directory containing input NetCDF files.
+    include_subdirectories : bool
+        Recurse into subdirectories.
+    output_dir : Path, optional
+        Directory for outputs (defaults to alongside inputs when None).
+    target_resolution : tuple[float, float]
+        Target grid resolution.
+    file_pattern : str
+        Glob pattern for selecting input files.
+    verbose : bool
+        Enable verbose logging.
+    overwrite : bool
+        Overwrite existing outputs.
+    max_workers : int, optional
+        Maximum parallel workers (default 4). Used only if enable_parallel is True.
+    enable_parallel : bool
+        Process multiple files in parallel (default True).
+
+    Returns
+    -------
+    dict[str, list[Path]]
+        Dictionary with ``'successful'``, ``'failed'`` and ``'skipped'``
+        keys mapping to lists of input file paths.
+    """
+    # Only process source files; exclude intermediates (_top_level, _regridded, _seafloor, _chunk_)
+    if include_subdirectories:
+        raw = list(input_dir.rglob(file_pattern))
+    else:
+        raw = list(input_dir.glob(file_pattern))
+    input_files = [p for p in raw if not _is_intermediate_nc(p)]
+
+    if not input_files:
+        print(f"No files found matching pattern '{file_pattern}' in {input_dir}")
+        return {"successful": [], "failed": [], "skipped": []}
+
+    results: dict[str, list[Path]] = {
+        "successful": [],
+        "failed": [],
+        "skipped": [],
+    }
+
+    # Group files by directory so one worker owns each directory (reuses seafloor cache + weight cache)
+    by_dir: dict[Path, list[Path]] = {}
+    for fp in input_files:
+        by_dir.setdefault(fp.parent, []).append(fp)
+    dir_jobs = [(d, sorted(fs)) for d, fs in by_dir.items()]
+
+    use_parallel = (
+        enable_parallel
+        and len(dir_jobs) >= 2
+        and max_workers is not None
+        and max_workers > 1
+    )
+
+    if use_parallel:
+        worker_args = [
+            (dir_path, file_list, output_dir, target_resolution, verbose, overwrite)
+            for dir_path, file_list in dir_jobs
+        ]
+        n_workers = min(max_workers, len(dir_jobs), mp.cpu_count())
+        if verbose:
+            print(f"Processing {len(dir_jobs)} directories in parallel with {n_workers} workers (files within each directory processed sequentially with shared cache).")
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            for file_results in executor.map(_worker_process_directory_both_levels, worker_args):
+                for input_path, status in file_results:
+                    if status["top_level"] and status["seafloor"]:
+                        results["successful"].append(input_path)
+                    elif status["top_level"] or status["seafloor"]:
+                        results["failed"].append(input_path)
+                    else:
+                        results["failed"].append(input_path)
+    else:
+        for dir_path, file_list in dir_jobs:
+            try:
+                file_results = process_directory_both_levels(
+                    dir_path=dir_path,
+                    file_list=file_list,
+                    output_dir=output_dir,
+                    target_resolution=target_resolution,
+                    verbose=verbose,
+                    overwrite=overwrite,
+                )
+                for fp, status in file_results:
+                    if status["top_level"] and status["seafloor"]:
+                        results["successful"].append(fp)
+                    elif status["top_level"] or status["seafloor"]:
+                        results["failed"].append(fp)
+                    else:
+                        results["failed"].append(fp)
+            except Exception:
+                for fp in file_list:
+                    results["failed"].append(fp)
+
+    return results
 
 def regrid_large_files(
     input_files: list[Path],
@@ -1822,9 +2688,19 @@ if __name__ == "__main__":
                        help="Target resolution (lon_res lat_res)")
     parser.add_argument("-p", "--pattern", default="*.nc", help="File pattern (for directories)")
     parser.add_argument("--include-subdirectories", action="store_true", default=True, help="Include subdirectories")
-    parser.add_argument("--top-level-only", action="store_true", default=True,
-                       help="Only process top level for multi-level files")
-    parser.add_argument("-v", "--verbose", action="store_true", default=True, help="Verbose output")
+    parser.add_argument("--extract-surface", action="store_true", default=False,
+                        help="Extract top level only and regrid that (surface)")
+    parser.add_argument("--extract-seafloor", action="store_true", default=False,
+                        help="Extract seafloor values and regrid only that")
+    parser.add_argument("--extreme-levels", action="store_true", default=False,
+                        help="Extract and regrid both surface (top level) and seafloor for each file")
+    parser.add_argument("--no-regrid-cache", action="store_true", default=False,
+                        help="Do not reuse regrid weight cache (regenerate weights each time)")
+    parser.add_argument("--no-seafloor-cache", action="store_true", default=False,
+                        help="Do not reuse seafloor depth indices cache")
+    parser.add_argument("-v", "--verbose", action="store_true", default=True, help="Verbose output (progress UI)")
+    parser.add_argument("--verbose-max", action="store_true", default=False,
+                        help="Maximum verbosity: print Grid type, File size, Large file messages")
     parser.add_argument("--quiet", action="store_true", help="Disable verbose output")
     parser.add_argument("-w", "--max-workers", default=4, type=int, help="Maximum parallel workers")
     parser.add_argument("--chunk-size-gb", type=float, default=2.0,
@@ -1835,12 +2711,16 @@ if __name__ == "__main__":
     parser.add_argument("--use-ui", action="store_true", default=True, help="Use UI for processing")
     # parser.add_argument("--cleanup", action="store_true", help="Clean up problematic files (*_top_level, *_chunk_*) before processing")
     parser.add_argument("--unlink-unprocessed", action="store_true", default=False, help="Unlink unprocessed files after processing")
+    parser.add_argument("--overwrite", action="store_true", default=False, help="Overwrite existing output files")
     
     args = parser.parse_args()
-    
+
     # handle verbose/quiet logic
     verbose = args.verbose and not args.quiet
-    
+    verbose_diagnostics = getattr(args, "verbose_max", False)
+    use_regrid_cache = not args.no_regrid_cache
+    use_seafloor_cache = not args.no_seafloor_cache
+
     # # handle cleanup if requested
     # if args.cleanup:
     #     if args.input.is_file():
@@ -1861,33 +2741,71 @@ if __name__ == "__main__":
     # determine if input is file or directory
     if args.input.is_file():
         # single file processing
-        success = regrid_single_file(
-            input_path=args.input,
-            output_path=args.output,
-            target_resolution=tuple(args.resolution),
-            top_level_only=args.top_level_only,
-            verbose=verbose,
-            use_ui=args.use_ui,
-        )
-        
+        if args.extreme_levels:
+            status = regrid_single_file_extreme_levels(
+                input_path=args.input,
+                output_dir=args.output,
+                target_resolution=tuple(args.resolution),
+                use_regrid_cache=use_regrid_cache,
+                use_seafloor_cache=use_seafloor_cache,
+                verbose=verbose,
+                overwrite=args.overwrite,
+            )
+            success = status["top_level"] and status["seafloor"]
+        else:
+            out_path = getattr(args, "output", None)
+            out_dir = out_path if (out_path and out_path.is_dir()) else None
+            success = regrid_single_file(
+                input_path=args.input,
+                output_path=None if out_dir else out_path,
+                output_dir=out_dir,
+                target_resolution=tuple(args.resolution),
+                extract_surface=args.extract_surface,
+                extract_seafloor=args.extract_seafloor,
+                use_regrid_cache=use_regrid_cache,
+                use_seafloor_cache=use_seafloor_cache,
+                verbose=verbose,
+                verbose_diagnostics=verbose_diagnostics,
+                use_ui=args.use_ui,
+                overwrite=args.overwrite,
+            )
+
         if success:
             print("Regridding successful!")
         else:
             print("Regridding failed!")
     else:
         # directory processing
-        results = regrid_directory(
-            input_dir=args.input,
-            output_dir=args.output,
-            include_subdirectories=args.include_subdirectories,
-            target_resolution=tuple(args.resolution),
-            file_pattern=args.pattern,
-            top_level_only=args.top_level_only,
-            verbose=verbose,
-            max_workers=args.max_workers,
-            enable_parallel=not args.no_parallel,
-            use_ui=True,
-        )
+        if args.extreme_levels:
+            results = regrid_directory_both_levels(
+                input_dir=args.input,
+                output_dir=args.output,
+                include_subdirectories=args.include_subdirectories,
+                target_resolution=tuple(args.resolution),
+                file_pattern=args.pattern,
+                verbose=verbose,
+                overwrite=args.overwrite,
+                max_workers=args.max_workers,
+                enable_parallel=not args.no_parallel,
+            )
+        else:
+            results = regrid_directory(
+                input_dir=args.input,
+                output_dir=args.output,
+                include_subdirectories=args.include_subdirectories,
+                target_resolution=tuple(args.resolution),
+                file_pattern=args.pattern,
+                extract_surface=args.extract_surface,
+                extract_seafloor=args.extract_seafloor,
+                use_regrid_cache=use_regrid_cache,
+                use_seafloor_cache=use_seafloor_cache,
+                verbose=verbose,
+                verbose_diagnostics=verbose_diagnostics,
+                max_workers=args.max_workers,
+                enable_parallel=not args.no_parallel,
+                use_ui=args.use_ui,
+                overwrite=args.overwrite,
+            )
         
         # print results
         console = Console()
@@ -1982,3 +2900,6 @@ if __name__ == "__main__":
 #         console.print(f"[green]Cleaned up {cleaned_count} problematic files[/green]")
     
 #     return cleaned_count
+
+
+# TODO: make sure the completed files aren't in the 'remaining' count
