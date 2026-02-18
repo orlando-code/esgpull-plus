@@ -164,6 +164,9 @@ cython_debug/
 # custom
 data/
 db/
+plots/
+cdo_weights/
 migrations/
+notebooks/
 # will provide an example search file but for now ignoring changes to this one
 search.yaml
