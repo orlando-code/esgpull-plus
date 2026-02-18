@@ -1,8 +1,11 @@
 # general
+import logging
 import os
 import re
+from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 from rich.console import Console
 from rich.panel import Panel
@@ -14,6 +17,8 @@ from rich.table import Table
 # custom
 from esgpull.esgpullplus import api, fileops, config, utils
 from esgpull.esgpullplus.enhanced_file import EnhancedFile
+
+log = logging.getLogger(__name__)
     
 
 class SearchResults:
@@ -27,9 +32,30 @@ class SearchResults:
         search_criteria: Optional[dict] = None,
         meta_criteria: Optional[dict] = None,
         config_path: Optional[str] = None,
+        file: bool = False,
     ):
-        self.search_criteria = search_criteria if search_criteria else {}
-        self.meta_criteria = meta_criteria if meta_criteria else {}
+        # Validate and set search_criteria
+        if search_criteria is None:
+            self.search_criteria = {}
+        elif isinstance(search_criteria, dict):
+            self.search_criteria = search_criteria
+        else:
+            raise TypeError(
+                f"search_criteria must be a dict, got {type(search_criteria).__name__}. "
+                f"Did you mean to pass a dictionary like {{'project': 'CMIP6'}} instead of {search_criteria}?"
+            )
+        
+        # Validate and set meta_criteria
+        if meta_criteria is None:
+            self.meta_criteria = {}
+        elif isinstance(meta_criteria, dict):
+            self.meta_criteria = meta_criteria
+        else:
+            raise TypeError(
+                f"meta_criteria must be a dict, got {type(meta_criteria).__name__}. "
+                f"Did you mean to pass a dictionary like {{'test': False}} instead of {meta_criteria}?"
+            )
+        
         self.search_filter = self.search_criteria.get("filter", {})
         self.top_n = self.search_filter.get("top_n", None)
         self.limit = self.search_filter.get("limit", 4)   # limit results to return, good for debugging
@@ -37,7 +63,10 @@ class SearchResults:
         self.results_df = None  # DataFrame to hold results for further processing
         self.results_df_top = None  # DataFrame for top N results from search
         self.fs = api.EsgpullAPI().esg.fs  # File system from Esgpull API
-        self.search_results_dir = self.fs.paths.data / "search_results"
+        self._file_search = file  # False = dataset search (faster), True = file search
+        # Cache within data_dir when set, else under esgpull data
+        data_dir = Path(meta_criteria.get("data_dir")) if meta_criteria and meta_criteria.get("data_dir") else None
+        self.search_results_dir = (data_dir / "search_results") if data_dir else (self.fs.paths.data / "search_results")
 
     def load_config(self, config_path: str) -> None:
         """Load search criteria and metadata from a YAML configuration file."""
@@ -45,6 +74,10 @@ class SearchResults:
         self.search_criteria = config.get("search_criteria", {})
         self.meta_criteria = config.get("meta_criteria", {})
         self.search_filter = self.search_criteria.get("filter", {})
+        # Update search_results_dir if data_dir in meta_criteria
+        data_dir = Path(self.meta_criteria.get("data_dir")) if self.meta_criteria.get("data_dir") else None
+        if data_dir:
+            self.search_results_dir = data_dir / "search_results"
         self.top_n = self.search_filter.get("top_n", None)  # get top n of grouped data ie. first n models from ensemble
         self.limit = self.search_filter.get("limit", 4)   # good for debugging
 
@@ -52,9 +85,9 @@ class SearchResults:
         """Perform a search using the provided criteria and populate results with enhanced metadata."""
         api_instance = api.EsgpullAPI()
         
-        # Use enhanced search to get all available metadata
+        # Use enhanced search to get all available metadata (file=False = dataset search, faster)
         try:
-            results = api_instance.search(criteria=self.search_criteria)
+            results = api_instance.search(criteria=self.search_criteria, file=self._file_search)
         except ExceptionGroup as eg:
             # Handle ExceptionGroup from ESGF API errors
             error_messages = []
@@ -103,12 +136,12 @@ class SearchResults:
         if not self.results_df.empty:
             return self.sort_results_by_metadata()
         else:
-            print("[SearchResults] No results found for given criteria.")
+            log.info("No results found for given criteria.")
 
     def sort_results_by_metadata(self) -> None:
         """Sort a list of EnhancedFile objects by institution_id, source_id, experiment_id, member_id."""
         if self.results_df is None or self.results_df.empty:
-            print("[SearchResults] No results to sort.")
+            log.info("No results to sort.")
             return
         # convert resolutions to float for sorting
         resolutions = self.results_df.apply(
@@ -144,14 +177,18 @@ class SearchResults:
         if search_state == "pre":
             # display search criteria
             console.print(
-                Panel(search_table, title="[cyan]Starting Search", border_style="cyan")
+                Panel(search_table, title="[cyan]Searching", border_style="cyan")
             )
         if search_state == "post":
             if len(self.search_results) == self.limit:
                 match_msg = " [orange1](limit of search reached)[/orange1]"
             else:
                 match_msg = ""
-            msg = f"[green]Search completed.[/green] [bold]{len(self.search_results)}[/bold] files{match_msg} found matching criteria."  # noqa
+            if len(self.search_results) > 1:
+                file_str = "files"
+            else:
+                file_str = "file"
+            msg = f"[green]Search completed.[/green] [bold]{len(self.search_results)}[/bold] {file_str}{match_msg} found matching criteria."  # noqa
             console.print(
                 Panel(msg, title="[green]Search Results", border_style="green")
             )
@@ -170,7 +207,7 @@ class SearchResults:
         )["dataset_id"]
         return self.results_df[self.results_df["dataset_id"].isin(top_dataset_ids)]
 
-    def clean_and_join_dict_vals(self):
+    def clean_and_join_dict_vals(self, search_criteria: Optional[dict] = None):
         """Clean and join dictionary values to create a descriptive search ID for saving search results."""
         def clean_value(val):
             if isinstance(val, int):
@@ -183,24 +220,168 @@ class SearchResults:
                 return val.strip()
             return str(val)
 
+        # Use provided search_criteria or self.search_criteria
+        criteria_to_use = search_criteria if search_criteria is not None else self.search_criteria
+        
         # clean all values, excluding the filter key (since this is a dictionary of strings)
-        cleaned_str = [clean_value(v) for k, v in self.search_criteria.items() if k != "filter"]
+        cleaned_str = [clean_value(v) for k, v in criteria_to_use.items() if k != "filter"]
         # order alphabetically in place to ensure consistent naming
-        cleaned_str.sort()
-        return "SEARCH_" + "_".join(cleaned_str).replace(" ", "")
+        # cleaned_str.sort()
+        # create search string in order: SEARCH_<project>_<table_id>_<experiment_id>_<variable>
+        # Support variable_id (CLI facet name) as alias for variable
+        project = criteria_to_use.get("project") or ""
+        table_id = criteria_to_use.get("table_id") or ""
+        experiment_id = criteria_to_use.get("experiment_id") or ""
+        variable = criteria_to_use.get("variable") or criteria_to_use.get("variable_id") or ""
+        return "SEARCH_" + str(project) + "_" + str(table_id) + "_" + str(experiment_id) + "_" + str(variable)
+        # return "SEARCH_" + "_".join(cleaned_str).replace(" ", "")
+    
+    def _generate_subsearches(self) -> list[dict]:
+        """
+        Break down search criteria into individual subsearches.
+        Creates one subsearch per combination of variable and experiment_id.
+        Other criteria (table_id, frequency, etc.) are preserved in each subsearch.
+        
+        Returns:
+            List of subsearch criteria dictionaries
+        """
+        subsearches = []
+        
+        # Get base criteria (everything except variable/variable_id and experiment_id and filter metadata)
+        base_criteria = {k: v for k, v in self.search_criteria.items() 
+                        if k not in ["variable", "variable_id", "experiment_id", "filter"]}
+        
+        # Parse variables and experiments (support variable_id as CLI alias)
+        variables = []
+        var_str = self.search_criteria.get("variable") or self.search_criteria.get("variable_id")
+        if var_str is not None:
+            if isinstance(var_str, str):
+                variables = [v.strip() for v in var_str.split(",")]
+            else:
+                variables = [var_str]
+        else:
+            variables = [None]  # No variable specified
+        
+        experiments = []
+        if "experiment_id" in self.search_criteria:
+            exp_str = self.search_criteria["experiment_id"]
+            if isinstance(exp_str, str):
+                experiments = [e.strip() for e in exp_str.split(",")]
+            else:
+                experiments = [exp_str]
+        else:
+            experiments = [None]  # No experiment specified
+        
+        table_ids = []
+        if "table_id" in self.search_criteria:
+            table_str = self.search_criteria["table_id"]
+            if isinstance(table_str, str):
+                table_ids = [t.strip() for t in table_str.split(",")]
+            else:
+                table_ids = [table_str]
+        else:
+            table_ids = [None]  # No table specified
+        # Use variable_id if that was in criteria (CLI/ESGF standard), else variable
+        var_key = "variable_id" if "variable_id" in self.search_criteria else "variable"
+        # Create subsearches for each variable-experiment-table combination
+        for variable in variables:
+            for experiment in experiments:
+                for table_id in table_ids:
+                    subsearch = base_criteria.copy()
+                    if variable is not None:
+                        subsearch[var_key] = variable
+                    if experiment is not None:
+                        subsearch["experiment_id"] = experiment
+                    if table_id is not None:
+                        subsearch["table_id"] = table_id
+                    # Preserve filter settings
+                    if "filter" in self.search_criteria:
+                        subsearch["filter"] = self.search_criteria["filter"].copy()
+                    subsearches.append(subsearch)
+        
+        return subsearches
+    
+    def _get_subsearch_cache_key(self, subsearch_criteria: dict) -> str:
+        """Generate a cache key for a subsearch. Includes file vs dataset to avoid mixing caches."""
+        base = self.clean_and_join_dict_vals(subsearch_criteria)
+        return f"{base}_file" if self._file_search else f"{base}_dataset"
+    
+    def _load_subsearch_from_cache(self, subsearch_criteria: dict) -> Optional[pd.DataFrame]:
+        """
+        Load a specific subsearch from cache if available.
+        Returns the DataFrame (even if empty) if cached, None if not cached.
+        Empty DataFrames indicate a cached negative search (no results).
+        """
+        cache_key = self._get_subsearch_cache_key(subsearch_criteria)
+        cache_file = self.search_results_dir / f"{cache_key}.csv"
+        
+        if cache_file.exists():
+            try:
+                # Check if file is empty (negative search marker)
+                if cache_file.stat().st_size == 0:
+                    # Empty file indicates a cached negative search
+                    return pd.DataFrame()
+                
+                df = pd.read_csv(cache_file)
+                if "_sa_instance_state" in df.columns:
+                    df = df.drop(columns=["_sa_instance_state"])
+                # Return DataFrame even if empty (indicates cached negative search)
+                return df
+            except pd.errors.EmptyDataError:
+                # Empty CSV file - this is a cached negative search
+                return pd.DataFrame()
+            except Exception as e:
+                log.warning(f"Could not load cache file {cache_file}: {e}")
+                return None
+        return None
+    
+    def _save_subsearch_to_cache(self, subsearch_criteria: dict, results_df: pd.DataFrame) -> None:
+        """
+        Save a subsearch result to cache (including empty results for negative searches).
+        Empty DataFrames are saved as empty CSV files to mark negative searches.
+        """
+        try:
+            self.search_results_dir.mkdir(parents=True, exist_ok=True)
+            cache_key = self._get_subsearch_cache_key(subsearch_criteria)
+            cache_file = self.search_results_dir / f"{cache_key}.csv"
+            
+            if not cache_file.exists():
+                if results_df.empty:
+                    # Save empty file as marker for negative search
+                    cache_file.touch()
+                    log.debug(f"Cached negative subsearch (no results): {cache_key}")
+                else:
+                    results_df.to_csv(cache_file, index=False)
+                    log.debug(f"Cached subsearch ({len(results_df)} results): {cache_key}")
+                log.debug(f"Cache file path: {cache_file}")
+                # Verify file was created
+                if cache_file.exists():
+                    log.debug(f"Cache file verified: {cache_file.stat().st_size} bytes")
+                else:
+                    log.error(f"Cache file was not created at {cache_file}")
+            else:
+                result_count = "empty" if results_df.empty else f"{len(results_df)} results"
+                log.debug(f"Subsearch already cached ({result_count}): {cache_key}")
+                log.debug(f"Cache file path: {cache_file}")
+        except (PermissionError, OSError) as e:
+            log.warning(f"Could not save to cache (continuing without cache): {e}")
+        except Exception as e:
+            log.error(f"Error saving to cache: {e}")
+            import traceback
+            traceback.print_exc()
 
     def check_system_resources(self, output_dir=None):
         """Check system resources and warn if they might be insufficient. Used to adjust batch size based on system resources."""
         try:
             import psutil
         except ImportError:
-            print("[yellow]Warning: psutil not available. Cannot check system resources.[/yellow]")
+            log.warning("psutil not available. Cannot check system resources.")
             return
         
         # check memory usage
         memory = psutil.virtual_memory()
         if memory.percent > 80:
-            print(f"[yellow]Warning: High memory usage ({memory.percent:.1f}%). Consider reducing batch size.[/yellow]")
+            log.warning(f"High memory usage ({memory.percent:.1f}%). Consider reducing batch size.")
         
         # check available disk space if output_dir is provided
         if output_dir:
@@ -208,16 +389,16 @@ class SearchResults:
                 disk = psutil.disk_usage(str(output_dir))
                 free_gb = disk.free / (1024**3)
                 if free_gb < 10:  # less than 10GB free
-                    print(f"[yellow]Warning: Low disk space ({free_gb:.1f}GB free). Ensure sufficient space for downloads.[/yellow]")
+                    log.warning(f"Low disk space ({free_gb:.1f}GB free). Ensure sufficient space for downloads.")
             except (OSError, PermissionError):
-                print("[yellow]Warning: Could not check disk space.[/yellow]")
+                log.warning("Could not check disk space.")
         
         # check file descriptor limit (Unix systems)
         if hasattr(os, 'getrlimit'):
             try:
                 soft, _ = os.getrlimit(os.RLIMIT_NOFILE)
                 if soft < 1000:
-                    print(f"[yellow]Warning: Low file descriptor limit ({soft}). May cause issues with many concurrent downloads.[/yellow]")
+                    log.warning(f"Low file descriptor limit ({soft}). May cause issues with many concurrent downloads.")
             except (OSError, AttributeError):
                 pass
 
@@ -266,11 +447,9 @@ class SearchResults:
 
         if not self.search_results_fp.exists():
             self.results_df.to_csv(self.search_results_fp, index=False)
-            print(f"Search results saved to {self.search_results_fp}")
+            log.info(f"Search results saved to {self.search_results_fp}")
         else:
-            print(
-                f"Search results already exist at {self.search_results_fp}. Not overwriting."
-            )
+            log.info(f"Search results already exist at {self.search_results_fp}. Not overwriting.")
 
     def load_search_results(self) -> pd.DataFrame:
         """Load search results from a CSV file."""
@@ -289,36 +468,149 @@ class SearchResults:
             raise FileNotFoundError(f"Search results file {search_fp} not found.")
 
     def run(self) -> list[EnhancedFile]:
-        """Perform search, sort, and return top n results as EnhancedFile objects. Loads from cache if available, else performs search and saves."""
+        """
+        Perform search, sort, and return top n results as EnhancedFile objects.
+        Uses modular caching: breaks down search into subsearches (by variable/experiment),
+        loads cached subsearches where available, performs new searches for missing ones,
+        and combines all results.
+        """
         if not self.search_criteria or not self.meta_criteria:
             self.load_config(config.search_criteria_fp)
-        # try to load from cache if available
-        try:
-            self.search_id = self.clean_and_join_dict_vals()
-            self.load_search_results()
-            print(f"Loaded search results from cache: {self.search_results_fp}")
-            self.search_message("post")
-        # if search results file not found, perform search and save
-        except FileNotFoundError:
+        
+        # Generate subsearches
+        subsearches = self._generate_subsearches()
+        log.info(f"Generated {len(subsearches)} subsearches")
+        
+        # Collect results from cache and new searches
+        cached_results = []
+        new_searches_needed = []
+        
+        # Check cache for each subsearch
+        for subsearch in subsearches:
+            cached_df = self._load_subsearch_from_cache(subsearch)
+            if cached_df is not None:   # if cached result found (even if empty - indicates negative search was cached)
+                # Cached result found (even if empty - indicates negative search was cached)
+                if not cached_df.empty:
+                    cached_results.append(cached_df)
+                    log.debug(f"Loaded from cache ({len(cached_df)} results): {self._get_subsearch_cache_key(subsearch)}")
+                else:
+                    log.debug(f"Loaded negative search from cache (no results): {self._get_subsearch_cache_key(subsearch)}")
+                # Don't add to new_searches_needed - this search is cached (even if empty)
+            else:   # no searches found: add to new_searches_needed list
+                new_searches_needed.append(subsearch)
+        
+        # Perform new searches for uncached subsearches
+        if new_searches_needed:
+            log.info(f"Performing {len(new_searches_needed)} new searches...")
             self.search_message("pre")
-            try:
-                self.do_search()
-            except RuntimeError as e:
-                # Re-raise API errors with clearer context
-                raise
-            except Exception as e:
-                # Catch any other unexpected errors during search
-                raise RuntimeError(
-                    f"Unexpected error during search: {e}\n"
-                    f"Search criteria: {self.search_criteria}"
-                ) from e
             
-            if self.results_df is not None and self.results_df.empty:
-                print("[SearchResults] No results found for given criteria.")
-                return []
-            self.search_message("post")
+            api_instance = api.EsgpullAPI()
+            for subsearch in new_searches_needed:
+                try:
+                    # Perform search for this subsearch
+                    try:
+                        # display the specific subsearch criteria
+                        log.info(f"Performing subsearch: {self._get_subsearch_cache_key(subsearch)}")
+                        results = api_instance.search(criteria=subsearch, file=self._file_search)
+                    except ExceptionGroup as eg:
+                        error_messages = []
+                        for exc in eg.exceptions:
+                            if isinstance(exc, httpx.HTTPStatusError):
+                                status_code = exc.response.status_code
+                                url = str(exc.request.url) if hasattr(exc, 'request') and exc.request else "unknown"
+                                error_messages.append(
+                                    f"ESGF server error {status_code} for {url}."
+                                )
+                            else:
+                                error_messages.append(str(exc))
+                        error_msg = "\n".join(error_messages)
+                        log.warning(f"Error searching for {self._get_subsearch_cache_key(subsearch)}: {error_msg}")
+                        continue
+                    except httpx.HTTPStatusError as e:
+                        status_code = e.response.status_code
+                        url = str(e.request.url) if hasattr(e, 'request') and e.request else "unknown"
+                        log.warning(f"ESGF server error {status_code} for {url} in subsearch {self._get_subsearch_cache_key(subsearch)}")
+                        continue
+                    except Exception as e:
+                        log.warning(f"Error in subsearch {self._get_subsearch_cache_key(subsearch)}: {e}")
+                        continue
+                    
+                    # Convert results to DataFrame
+                    enhanced_results = []
+                    # print(f"[SearchResults] Results type: {type(results)}")
+                    
+                    if results is None:
+                        # log.warning(f"No results returned for subsearch {self._get_subsearch_cache_key(subsearch)}")
+                        continue
+                    
+                    if not hasattr(results, '__iter__'):
+                        # log.warning(f"Results is not iterable for subsearch {self._get_subsearch_cache_key(subsearch)}")
+                        continue
+                    
+                    # Convert to list if it's a generator to avoid consuming it
+                    if hasattr(results, '__next__') and not hasattr(results, '__len__'):
+                        # print(f"[SearchResults] Results is a generator, converting to list...")
+                        results = list(results)
+                        log.debug(f"Converted to list with {len(results)} items")
+                    
+                    for result in results:
+                        try:
+                            if isinstance(result, dict):
+                                enhanced_results.append(result)
+                            else:
+                                enhanced_file = EnhancedFile.fromdict(result)
+                                enhanced_results.append(enhanced_file.asdict())
+                        except Exception as e:
+                            log.warning(f"Error processing result: {e}")
+                            continue
+                    
+                    #                     # print(f"[SearchResults] Enhanced results count: {len(enhanced_results)}")
+                    
+                    # Always create DataFrame and save to cache (even if empty - this caches negative searches)
+                    try:
+                        subsearch_df = pd.DataFrame(enhanced_results)
+                        if subsearch_df.empty:
+                            log.info(f"No results found for subsearch: {self._get_subsearch_cache_key(subsearch)}")
+                        else:
+                            log.debug(f"DataFrame created with {len(subsearch_df)} rows")
+                        
+                        # Save to cache (including empty results for negative searches)
+                        self._save_subsearch_to_cache(subsearch, subsearch_df)
+                        log.debug(f"Saved to cache: {self._get_subsearch_cache_key(subsearch)}")
+                        
+                        # Only add non-empty results to cached_results
+                        if not subsearch_df.empty:
+                            cached_results.append(subsearch_df)
+                    except Exception as e:
+                        log.error(f"Error creating DataFrame or saving to cache: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        continue
+                    
+                except Exception as e:
+                    log.warning(f"Failed to process subsearch {self._get_subsearch_cache_key(subsearch)}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+        
+        # Combine all results
+        if cached_results:
+            self.results_df = pd.concat(cached_results, ignore_index=True)
+            # Remove duplicates: file_id for file search, dataset_id for dataset search
+            if "file_id" in self.results_df.columns:
+                self.results_df = self.results_df.drop_duplicates(subset=["file_id"], keep="first")
+            elif "dataset_id" in self.results_df.columns:
+                self.results_df = self.results_df.drop_duplicates(subset=["dataset_id"], keep="first")
+        else:
+            self.results_df = pd.DataFrame()
+        
+        if self.results_df is not None and not self.results_df.empty:
             self.sort_results_by_metadata()
-            self.save_searches()
+            self.search_message("post")
+        else:
+            log.info("No results found for given criteria.")
+            return []
+        
         # always get top_n from the current results_df
         top_n_df = self.get_top_n() if self.top_n else self.results_df
         # limit results to return
@@ -353,15 +645,54 @@ class SearchResults:
         summary = self.get_enhanced_metadata_summary()
         
         if not summary:
-            print("[SearchResults] No enhanced metadata available.")
+            log.info("No enhanced metadata available.")
             return
         
-        print(f"\n[SearchResults] Enhanced Metadata Summary:")
-        print(f"Total metadata fields: {len(summary)}")
-        
+        log.info(f"Enhanced Metadata Summary: {len(summary)} fields")
         for field, info in summary.items():
-            print(f"  {field}: {info['count']} unique values")
-            if info['has_more']:
-                print(f"    Examples: {', '.join(map(str, info['values']))}...")
-            else:
-                print(f"    Values: {', '.join(map(str, info['values']))}")
+            vals = ', '.join(map(str, info['values']))
+            suffix = "..." if info['has_more'] else ""
+            log.info(f"  {field}: {info['count']} unique values - {vals}{suffix}")
+
+    def get_experiments_by_source(self, variable: Optional[str] = None) -> pd.DataFrame:
+        """Delegate to :mod:`search_analysis`. See :func:`search_analysis.get_experiments_by_source`."""
+        from esgpull.esgpullplus import search_analysis
+        return search_analysis.get_experiments_by_source(self.results_df, variable=variable)
+
+    def summarize_symmetrical_datasets(self) -> pd.DataFrame:
+        """Delegate to :mod:`search_analysis`. See :func:`search_analysis.summarize_symmetrical_datasets`."""
+        from esgpull.esgpullplus import search_analysis
+        return search_analysis.summarize_symmetrical_datasets(self.results_df)
+
+    def analyze_source_availability(
+        self,
+        historical_experiment: str = "historical",
+        ssp_pattern: str = "ssp",
+        require_both: bool = True,
+    ) -> pd.DataFrame:
+        """Delegate to :mod:`search_analysis`. See :func:`search_analysis.analyze_source_availability`."""
+        from esgpull.esgpullplus import search_analysis
+        return search_analysis.analyze_source_availability(
+            self.results_df,
+            historical_experiment=historical_experiment,
+            ssp_pattern=ssp_pattern,
+            require_both=require_both,
+        )
+
+    def visualize_source_availability(self, analysis_df=None, **kwargs) -> dict:
+        """Delegate to :mod:`search_analysis`. See :func:`search_analysis.visualize_source_availability`."""
+        from esgpull.esgpullplus import search_analysis
+        if analysis_df is None:
+            analysis_df = self.analyze_source_availability(**{
+                k: v for k, v in kwargs.items()
+                if k in ("historical_experiment", "ssp_pattern", "require_both")
+            })
+        return search_analysis.visualize_source_availability(analysis_df, **{
+            k: v for k, v in kwargs.items()
+            if k in ("output_dir", "show_plots", "save_plots")
+        })
+
+    def analyze_and_visualize_sources(self, **kwargs) -> tuple[pd.DataFrame, dict]:
+        """Delegate to :mod:`search_analysis`. See :func:`search_analysis.analyze_and_visualize`."""
+        from esgpull.esgpullplus import search_analysis
+        return search_analysis.analyze_and_visualize(self.results_df, **kwargs)

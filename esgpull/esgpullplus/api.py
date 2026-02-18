@@ -1,3 +1,4 @@
+import re
 import signal
 import sys
 import threading
@@ -10,6 +11,7 @@ from rich import print as rich_print
 
 
 from esgpull.cli.utils import (
+    parse_facets,
     parse_query,
     serialize_queries_from_file,
 )
@@ -17,8 +19,7 @@ from esgpull.cli.utils import (
 # XX processing box
 
 # custom
-from esgpull.esgpullplus import api, download, fileops, search, esgpuller
-from esgpull.esgpullplus.enhanced_context import Context
+from esgpull.esgpullplus import download, fileops, search, esgpuller
 from esgpull.graph import Graph
 from esgpull.models import File, Query
 from esgpull.tui import Verbosity
@@ -78,18 +79,33 @@ class EsgpullAPI:
         self.verbosity = Verbosity[verbosity.capitalize()]
         self.esg = esgpuller.Esgpull(path=config_path, verbosity=self.verbosity)
 
-    def search(self, criteria: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def search(
+        self,
+        criteria: Optional[Dict[str, Any]] = None,
+        facets: Optional[List[str]] = None,
+        file: bool = False,
+    ) -> List[Dict[str, Any]]:
         """
-        Searches ESGF nodes for files/datasets matching the criteria.
-        Uses distributed search to query multiple nodes, with retry logic for 500 errors.
+        Searches ESGF nodes for datasets or files matching the criteria.
+        Aligns with CLI: default file=False (dataset search, faster).
 
         Args:
-            criteria (dict): A dictionary of search facets (e.g., project, variable).
-                      Can include 'limit' to restrict the number of results.
+            criteria (dict, optional): A dictionary of search facets (e.g., project, variable).
+                Can include 'limit' to restrict the number of results.
+            facets (list[str], optional): CLI-style facet strings (e.g. project:CMIP6 variable:tas
+                experiment_id:historical table_id:Amon frequency:mon). Same format as esgpull search.
+                If provided, takes precedence over criteria.
+            file (bool): If True, search for files (type=File); if False, search for datasets
+                (type=Dataset). Default False matches CLI default - dataset search is faster
+                (fewer records, same metadata for source analysis).
 
         Returns:
-            A list of dictionaries, where each dictionary represents a found file/dataset.
+            A list of dictionaries, where each dictionary represents a found file or dataset.
         """
+        if facets is not None:
+            criteria = self._facets_to_criteria(facets)
+        if criteria is None:
+            criteria = {}
         # Use the same logic as CLI: parse_query, then context.search
         _criteria = criteria.copy()
         max_hits = _criteria.pop("limit", None)
@@ -111,14 +127,25 @@ class EsgpullAPI:
         self.esg.graph.resolve_require(query)
         
         try:
-            # Use a fresh EnhancedContext bound to a fresh OriginalContext to avoid event-loop/thread issues
             from esgpull.esgpullplus.enhanced_context import EnhancedContext
-            from esgpull.context import Context as OriginalContext
-            local_original = OriginalContext(self.esg.config, noraise=True)
-            local_ctx = EnhancedContext()
-            local_ctx._original_context = local_original
-            results = local_ctx.search(query, file=True, max_hits=max_hits)
-            return [result.asdict() for result in results]
+            local_ctx = EnhancedContext(config=self.esg.config, noraise=True)
+            results = local_ctx.search(query, file=file, max_hits=max_hits)
+            # Dataset results are already dicts; file results are EnhancedFile
+            return [
+                r.asdict() if hasattr(r, "asdict") else r
+                for r in results
+            ]
+        except (IndexError, ValueError) as e:
+            # Handle empty hits that cause IndexError in _distribute_hits_impl
+            error_msg = str(e).lower()
+            if "index" in error_msg or "list index out of range" in error_msg or "list index" in error_msg:
+                # Empty hits - return empty results gracefully
+                rich_print(
+                    "[yellow]⚠️  Search returned no results (empty hits). "
+                    "This may indicate the search criteria matched no files.[/yellow]"
+                )
+                return []
+            raise
         except Exception as e:
             # If distributed search fails with 500 error, try alternative nodes
             if self._is_server_error(e):
@@ -126,9 +153,18 @@ class EsgpullAPI:
                     "[yellow]⚠️  Distributed search failed with server error. "
                     "Retrying with alternative ESGF nodes...[/yellow]"
                 )
-                return self._search_with_retry(_criteria, tags, max_hits)
+                return self._search_with_retry(_criteria, tags, max_hits, file=file)
             raise
     
+    def _facets_to_criteria(self, facets: List[str]) -> Dict[str, Any]:
+        """
+        Convert CLI-style facet strings to a criteria dict for search().
+        Example: ["project:CMIP6", "variable_id:tas", "experiment_id:ssp*"]
+        -> {"project": "CMIP6", "variable_id": "tas", "experiment_id": "ssp*"}
+        """
+        selection = parse_facets(facets)
+        return {k: ",".join(v) if len(v) > 1 else v[0] for k, v in selection.items()}
+
     def _is_server_error(self, exception: Exception) -> bool:
         """Check if exception is a server error (500, 502, 503, etc.)."""
         import httpx
@@ -146,6 +182,7 @@ class EsgpullAPI:
         criteria: Dict[str, Any],
         tags: list[str],
         max_hits: Optional[int],
+        file: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Retry search with alternative ESGF nodes when primary search fails.
@@ -198,20 +235,18 @@ class EsgpullAPI:
         
         for node in alternative_nodes:
             try:
-                rich_print(f"[blue]🔍 Trying ESGF node: {node}[/blue]")
-                # Build a fresh OriginalContext bound to this node (without mutating shared self.esg.context)
-                from esgpull.context import Context as OriginalContext
+                rich_print(f"[cyan]🔍 Trying ESGF node: {node}[/cyan]")
                 from esgpull.esgpullplus.enhanced_context import EnhancedContext
-                # Temporarily set node for creating the local context
                 self.esg.config.api.index_node = node
-                local_original = OriginalContext(self.esg.config, noraise=True)
-                local_ctx = EnhancedContext()
-                local_ctx._original_context = local_original
-                results = local_ctx.search(query, file=True, max_hits=max_hits)
+                local_ctx = EnhancedContext(config=self.esg.config, noraise=True)
+                results = local_ctx.search(query, file=file, max_hits=max_hits)
                 rich_print(f"[green]✅ Successfully searched using node: {node}[/green]")
                 # Restore original node
                 self.esg.config.api.index_node = original_node
-                return [result.asdict() for result in results]
+                return [
+                    r.asdict() if hasattr(r, "asdict") else r
+                    for r in results
+                ]
                     
             except Exception as node_error:
                 # Restore node before evaluating error
@@ -276,13 +311,11 @@ class EsgpullAPI:
             return []
         
         rich_print(
-            f"[blue]🔍 Searching for alternative files for {failed_file.get('filename', 'unknown file')}...[/blue]"
+            f"[cyan]🔍 Searching for alternative files for {failed_file.get('filename', 'unknown file')}...[/cyan]"
         )
         
         try:
-            # Search for alternatives using a fresh API/context to avoid event-loop/thread issues
-            alt_api = EsgpullAPI(verbosity=str(self.verbosity.name).lower()) if hasattr(self, 'verbosity') else EsgpullAPI()
-            alternatives = alt_api.search(search_criteria)
+            alternatives = self.search(search_criteria)
             
             # Filter alternatives
             filtered_alternatives = []
@@ -606,20 +639,80 @@ class EsgpullAPI:
         return None
 
 
-def search_and_download(search_criteria, meta_criteria, API=None):
+def _parse_year_range_from_filename(filename: str) -> Optional[tuple[int, int]]:
+    """
+    Parse file time range from CMIP-style filename (e.g. ..._201501-202012.nc or ..._185001-185512.nc).
+    Returns (file_start_year, file_end_year) or None if pattern not found.
+    """
+    if not filename:
+        return None
+    match = re.search(r"_(\d{6})-(\d{6})(?:\.[^.]+)?$", filename.strip())
+    if not match:
+        return None
+    try:
+        start_ym = int(match.group(1))  # YYYYMM
+        end_ym = int(match.group(2))
+        return (start_ym // 100, end_ym // 100)
+    except (ValueError, TypeError):
+        return None
+
+
+def _file_in_year_range(
+    file_obj: Any,
+    start_year: Optional[int],
+    end_year: Optional[int],
+) -> bool:
+    """
+    Return True if the file's time range passes the year filter.
+
+    - Both start_year and end_year: keep if file range overlaps [start_year, end_year].
+    - Only end_year: keep if file ends on or before end_year (file_end_year <= end_year).
+    - Only start_year: keep if file starts on or after start_year (file_start_year >= start_year).
+
+    File range is parsed from filename (_YYYYMM-YYYYMM). If unparseable, keep the file (assume in range).
+    """
+    filename = getattr(file_obj, "filename", None)
+    if filename is None and hasattr(file_obj, "asdict"):
+        filename = file_obj.asdict().get("filename")
+    if not filename:
+        return True
+    parsed = _parse_year_range_from_filename(str(filename))
+    if parsed is None:
+        return True
+    file_start_year, file_end_year = parsed
+    if start_year is not None and end_year is not None:
+        return file_end_year >= start_year and file_start_year <= end_year
+    if end_year is not None:
+        return file_end_year <= end_year
+    if start_year is not None:
+        return file_start_year >= start_year
+    return True
+
+
+def search_and_download(search_criteria, meta_criteria, API=None, symmetrical=False, symmetrical_sources_cache=None):
     """
     Perform a search and download files based on the provided criteria.
     Uses batching to avoid UI issues with large numbers of files.
+    
+    Args:
+        search_criteria: Dictionary of search criteria
+        meta_criteria: Dictionary of metadata criteria (may include start_year, end_year for time filter)
+        API: Optional EsgpullAPI instance
+        symmetrical: If True, only download files from sources that have both 
+                    historical and SSP experiments available
+        symmetrical_sources_cache: Pre-computed cache of symmetrical sources (from full search)
     """
     # Check for shutdown request
     if _shutdown_requested.is_set():
         rich_print("[yellow]Shutdown requested, skipping search and download.[/yellow]")
         return
 
-    # load configuration
+    # load configuration - use file=True for downloads (need url, filename, local_path)
+    # dataset search (file=False) is for analysis only; download needs file-level metadata
     search_results = search.SearchResults(
         search_criteria=search_criteria,
         meta_criteria=meta_criteria,
+        file=True,
     )
     
     # Check system resources before starting
@@ -636,13 +729,201 @@ def search_and_download(search_criteria, meta_criteria, API=None):
     if not files:
         rich_print("No files found matching the search criteria.")
         return
+
+    # Filter by year range (meta_criteria start_year / end_year) if either is set
+    start_year = meta_criteria.get("start_year")
+    end_year = meta_criteria.get("end_year")
+    if start_year is not None:
+        try:
+            start_year = int(start_year)
+        except (TypeError, ValueError):
+            start_year = None
+    if end_year is not None:
+        try:
+            end_year = int(end_year)
+        except (TypeError, ValueError):
+            end_year = None
+    if start_year is not None or end_year is not None:
+        original_count = len(files)
+        files = [f for f in files if _file_in_year_range(f, start_year, end_year)]
+        removed = original_count - len(files)
+        if removed > 0:
+            if start_year is not None and end_year is not None:
+                range_msg = f"[{start_year}-{end_year}]"
+            elif end_year is not None:
+                range_msg = f"before or in {end_year} (end_year)"
+            else:
+                range_msg = f"from {start_year} onward (start_year)"
+            rich_print(
+                f"[cyan]📅 Time filter {range_msg}: removed {removed} file(s) outside range "
+                f"({len(files)} remaining)[/cyan]"
+            )
+        if not files:
+            rich_print("No files remaining after time range filter.")
+            return
+
+    # Filter for symmetrical datasets if requested
+    if symmetrical:
+        rich_print("[cyan]🔍 Filtering for symmetrical datasets (sources with both historical and SSP experiments)...[/cyan]")
+        try:
+            # Use pre-computed cache if available, otherwise analyze current results
+            if symmetrical_sources_cache is not None:
+                rich_print("[dim]📊 Using pre-computed symmetrical sources cache[/dim]")
+                symmetrical_sources = symmetrical_sources_cache['with_var']
+                symmetrical_sources_no_var = symmetrical_sources_cache['without_var']
+                
+                if not symmetrical_sources and not symmetrical_sources_no_var:
+                    rich_print("[yellow]⚠️  No symmetrical sources in cache. No files to download.[/yellow]")
+                    return
+            else:
+                # Fallback: analyze current results (may not work if only one experiment)
+                rich_print("[yellow]⚠️  No symmetrical sources cache available. Analyzing current search results...[/yellow]")
+                rich_print("[yellow]⚠️  Note: This may fail if current search only includes one experiment type.[/yellow]")
+                
+                # Ensure we have results_df populated
+                if search_results.results_df is None or search_results.results_df.empty:
+                    rich_print("[yellow]⚠️  No search results available for symmetry analysis. Cannot filter.[/yellow]")
+                    return
+                
+                # Analyze source availability to find sources with both historical and SSP
+                analysis_df = search_results.analyze_source_availability(
+                    historical_experiment="historical",
+                    ssp_pattern="ssp",
+                    require_both=True,
+                )
+                
+                if analysis_df.empty:
+                    rich_print("[yellow]⚠️  No sources found with both historical and SSP experiments. No files to download.[/yellow]")
+                    return
+                
+                # Normalize values to ensure consistent matching
+                def normalize_value(val):
+                    """Normalize a value for consistent matching."""
+                    if val is None:
+                        return None
+                    try:
+                        if isinstance(val, float) and val != val:
+                            return None
+                    except (TypeError, ValueError):
+                        pass
+                    try:
+                        return str(val).strip()
+                    except (TypeError, ValueError):
+                        return None
+                
+                symmetrical_sources = set()
+                symmetrical_sources_no_var = set()
+                
+                for _, row in analysis_df.iterrows():
+                    var = normalize_value(row.get("variable", None))
+                    inst_id = normalize_value(row["institution_id"])
+                    src_id = normalize_value(row["source_id"])
+                    
+                    if inst_id and src_id:
+                        if var:
+                            symmetrical_sources.add((var, inst_id, src_id))
+                        symmetrical_sources_no_var.add((inst_id, src_id))
+            
+            rich_print(f"[green]✅ Using {len(symmetrical_sources)} symmetrical source(s) for filtering[/green]")
+            
+            # Normalize function for file attributes
+            def normalize_value(val):
+                """Normalize a value for consistent matching."""
+                if val is None:
+                    return None
+                try:
+                    if isinstance(val, float) and val != val:
+                        return None
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    return str(val).strip()
+                except (TypeError, ValueError):
+                    return None
+            
+            # Filter files to only include those from symmetrical sources
+            original_count = len(files)
+            filtered_files = []
+            skipped_count = 0
+            skipped_details = {}
+            
+            for file in files:
+                # Get attributes from the file
+                inst_id = None
+                src_id = None
+                var = None
+                
+                if hasattr(file, 'institution_id') and hasattr(file, 'source_id'):
+                    inst_id = getattr(file, 'institution_id', None)
+                    src_id = getattr(file, 'source_id', None)
+                    var = getattr(file, 'variable', None)
+                elif hasattr(file, 'asdict'):
+                    # Fallback: convert to dict and check
+                    file_dict = file.asdict()
+                    inst_id = file_dict.get("institution_id")
+                    src_id = file_dict.get("source_id")
+                    var = file_dict.get("variable")
+                
+                # Normalize values for consistent matching
+                inst_id = normalize_value(inst_id)
+                src_id = normalize_value(src_id)
+                var = normalize_value(var)
+                
+                if inst_id and src_id:
+                    # Try matching with variable first
+                    if var:
+                        source_key = (var, inst_id, src_id)
+                        if source_key in symmetrical_sources:
+                            filtered_files.append(file)
+                            continue
+                    
+                    # Fallback: try matching without variable
+                    source_key_no_var = (inst_id, src_id)
+                    if source_key_no_var in symmetrical_sources_no_var:
+                        filtered_files.append(file)
+                        continue
+                    
+                    # Track why files are being skipped for debugging
+                    skip_key = f"{inst_id}/{src_id}"
+                    if skip_key not in skipped_details:
+                        skipped_details[skip_key] = 0
+                    skipped_details[skip_key] += 1
+                    skipped_count += 1
+                else:
+                    # File doesn't have institution_id or source_id - skip it
+                    skipped_count += 1
+            
+            files = filtered_files
+            filtered_count = len(files)
+            
+            source_str = "sources" if filtered_count > 1 else "source"
+            # Debug output
+            if skipped_details:
+                rich_print(f"[dim]📊 Skipped {len(skipped_details)} unique {source_str}: {list(skipped_details.keys())[:5]}...[/dim]")
+            
+            if filtered_count < original_count:
+                rich_print(
+                    f"[cyan]📊 Filtered from {original_count} to {filtered_count} files "
+                    f"({original_count - filtered_count} removed from non-symmetrical {source_str})[/cyan]"
+                )
+            elif filtered_count == original_count and original_count > 0:
+                rich_print(f"[green]✅ All {filtered_count} files are from symmetrical {source_str}[/green]")
+            else:
+                rich_print(f"[yellow]⚠️  No files remaining after filtering[/yellow]")
+                return
+                
+        except Exception as e:
+            rich_print(f"[yellow]⚠️  Error filtering for symmetrical datasets: {e}[/yellow]")
+            rich_print("[yellow]⚠️  Proceeding with all files (no filtering applied)[/yellow]")
+            import traceback
+            traceback.print_exc()
     
     # Determine batch size based on system resources and file count
     requested_batch_size = meta_criteria.get("batch_size", 50)  # Default batch size
     adaptive_batch_size = search_results._get_adaptive_batch_size(requested_batch_size, len(files))
     
     if adaptive_batch_size != requested_batch_size:
-        rich_print(f"[blue]Adapted batch size from {requested_batch_size} to {adaptive_batch_size} based on system resources[/blue]")
+        rich_print(f"[cyan]Adapted batch size from {requested_batch_size} to {adaptive_batch_size} based on system resources[/cyan]")
 
     # Process files in batches
     total_files = len(files)
@@ -650,11 +931,11 @@ def search_and_download(search_criteria, meta_criteria, API=None):
     total_files_str = "files" if total_files > 1 else "file"
     batch_str = "batches" if total_batches > 1 else "batch"
     batch_size_str = "files" if adaptive_batch_size > 1 else "file"
-    rich_print(f"[blue]📥 Processing {total_files} {total_files_str} in {total_batches} {batch_str} of up to {adaptive_batch_size} {batch_size_str} each...[/blue]")
+    rich_print(f"[cyan]📥 Processing {total_files} {total_files_str} in {total_batches} {batch_str} of up to {adaptive_batch_size} {batch_size_str} each...[/cyan]")
     
     try:
         if API is None:
-            API = api.EsgpullAPI()
+            API = EsgpullAPI()
         
         for batch_num in range(total_batches):
             # Check for shutdown request at start of each batch
@@ -666,14 +947,16 @@ def search_and_download(search_criteria, meta_criteria, API=None):
             end_idx = min(start_idx + adaptive_batch_size, total_files)
             batch_files = files[start_idx:end_idx]
             
-            rich_print(f"[blue]📦 Processing batch {batch_num + 1}/{total_batches} ({len(batch_files)} files)...[/blue]")
+            rich_print(f"[cyan]📦 Processing batch {batch_num + 1}/{total_batches} ({len(batch_files)} files)...[/cyan]")
             
             try:
                 find_alternatives = meta_criteria.get("find_alternatives", True)
+                data_dir = meta_criteria.get("data_dir")
                 download_manager = download.DownloadSubset(
                     files=batch_files,
                     fs=API.esg.fs,
                     output_dir=output_dir,
+                    data_dir=data_dir,
                     subset=meta_criteria.get("subset"),
                     max_workers=meta_criteria.get("max_workers", 32),
                     verbose=meta_criteria.get("verbose", False),
@@ -685,7 +968,7 @@ def search_and_download(search_criteria, meta_criteria, API=None):
                 download_manager._shutdown_requested = _shutdown_requested
                 download_manager.run()
                 
-                rich_print(f"[green]✅ Batch {batch_num + 1}/{total_batches} completed successfully[/green]")
+                rich_print(f"[green]✅ Batch {batch_num + 1}/{total_batches} completed[/green]")
                 
             except KeyboardInterrupt:
                 rich_print("[yellow]Download interrupted by user.[/yellow]")
@@ -704,10 +987,10 @@ def search_and_download(search_criteria, meta_criteria, API=None):
 
 def remove_part_files(main_dir: Path) -> None:
     """
-    Remove part files from the main directory.
+    Remove part files from the main directory (searches recursively).
     This is useful for cleaning up temporary files after downloads.
     """
-    part_files = list(main_dir.glob("*.part"))
+    part_files = list(main_dir.glob("**/*.part"))
     if not part_files:
         rich_print("No .part files found to remove.")
         return
@@ -720,23 +1003,58 @@ def remove_part_files(main_dir: Path) -> None:
             rich_print(f"Failed to remove {part_file}: {e}")
 
 
-def run():
-    """Main run function with graceful interrupt handling."""
+def run(symmetrical: bool = False):
+    """
+    Main run function with graceful interrupt handling.
+    
+    Args:
+        symmetrical: If True, only download files from sources that have both 
+                     historical and SSP experiments available. Defaults to False.
+                     When called from CLI, this is overridden by --symmetrical flag.
+    """
+    import argparse
+    import sys
+    
+    # Only parse command-line arguments if called from CLI (not from notebook/REPL)
+    # Check if we're in IPython/Jupyter by looking for IPython in sys.modules
+    is_notebook = 'IPython' in sys.modules or 'ipykernel' in sys.modules
+    
+    if not is_notebook and len(sys.argv) > 1:
+        # Parse command-line arguments
+        parser = argparse.ArgumentParser(
+            description="ESGF search and download tool with symmetrical dataset filtering"
+        )
+        parser.add_argument(
+            "--symmetrical",
+            action="store_true",
+            help="Only download files from sources that have both historical and SSP experiments available (symmetrical datasets)",
+        )
+        args = parser.parse_args()
+        symmetrical = args.symmetrical
+    
     with GracefulInterruptHandler():
         try:
             # Show startup message with interrupt info
             rich_print(
                 "[dim]💡 Tip: Press Ctrl+C at any time for graceful shutdown[/dim]"
             )
+            
+            if symmetrical:
+                rich_print(
+                    "[cyan]🔍 Symmetrical mode enabled: Only downloading datasets with both historical and SSP experiments[/cyan]"
+                )
 
             REPO_ROOT = fileops.get_repo_root()
+            print("REPO ROOT:", REPO_ROOT)
             CRITERIA_DICT = fileops.read_yaml(REPO_ROOT / "search.yaml")
             SEARCH_CRITERIA_CONFIG = CRITERIA_DICT.get("search_criteria", {})
             META_CRITERIA_CONFIG = CRITERIA_DICT.get("meta_criteria", {})
-            API = api.EsgpullAPI()
+            API = EsgpullAPI()
 
             # remove any existing .part files in the main directory to avoid conflicts
-            remove_part_files(API.esg.fs.paths.data)
+            data_dir = META_CRITERIA_CONFIG.get("data_dir")
+            main_dir = Path(data_dir) if data_dir else API.esg.fs.paths.data
+            remove_part_files(main_dir)
 
             # Convert comma-separated strings to lists for iteration
             exp_str = SEARCH_CRITERIA_CONFIG.get("experiment_id", "")
@@ -744,6 +1062,76 @@ def run():
 
             var_str = SEARCH_CRITERIA_CONFIG.get("variable", "")
             variables = [v.strip() for v in var_str.split(",") if v.strip()]
+
+            # If symmetrical mode, first determine which sources have both historical and SSP
+            symmetrical_sources_cache = None
+            if symmetrical:
+                rich_print("[cyan]🔍 Pre-analyzing symmetrical sources (searching all experiments)...[/cyan]")
+                try:
+                    # Create a search with ALL experiments to determine symmetry
+                    full_search_criteria = SEARCH_CRITERIA_CONFIG.copy()
+                    # Don't filter by individual experiment - use all experiments
+                    # The search will include all experiments from the original criteria
+                    
+                    full_search_results = search.SearchResults(
+                        search_criteria=full_search_criteria,
+                        meta_criteria=META_CRITERIA_CONFIG,
+                    )
+                    
+                    # Run the full search to get all results
+                    _ = full_search_results.run()  # Get all files, but we only need results_df
+                    
+                    if full_search_results.results_df is not None and not full_search_results.results_df.empty:
+                        # Analyze for symmetrical sources
+                        analysis_df = full_search_results.analyze_source_availability(
+                            historical_experiment="historical",
+                            ssp_pattern="ssp",
+                            require_both=True,
+                        )
+                        
+                        if not analysis_df.empty:
+                            # Build cache of symmetrical sources
+                            def normalize_value(val):
+                                if val is None:
+                                    return None
+                                try:
+                                    if isinstance(val, float) and val != val:
+                                        return None
+                                except (TypeError, ValueError):
+                                    pass
+                                try:
+                                    return str(val).strip()
+                                except (TypeError, ValueError):
+                                    return None
+                            
+                            symmetrical_sources_cache = {
+                                'with_var': set(),
+                                'without_var': set()
+                            }
+                            
+                            for _, row in analysis_df.iterrows():
+                                var = normalize_value(row.get("variable", None))
+                                inst_id = normalize_value(row["institution_id"])
+                                src_id = normalize_value(row["source_id"])
+                                
+                                if inst_id and src_id:
+                                    if var:
+                                        symmetrical_sources_cache['with_var'].add((var, inst_id, src_id))
+                                    symmetrical_sources_cache['without_var'].add((inst_id, src_id))
+                            
+                            rich_print(
+                                f"[green]✅ Found {len(symmetrical_sources_cache['with_var'])} symmetrical source(s) "
+                                f"(variable+institution+source combinations)[/green]"
+                            )
+                        else:
+                            rich_print("[yellow]⚠️  No symmetrical sources found in full search. Symmetry filtering will be skipped.[/yellow]")
+                    else:
+                        rich_print("[yellow]⚠️  No results from full search. Symmetry filtering will be skipped.[/yellow]")
+                except Exception as e:
+                    rich_print(f"[yellow]⚠️  Error pre-analyzing symmetrical sources: {e}[/yellow]")
+                    rich_print("[yellow]⚠️  Symmetry filtering will be skipped.[/yellow]")
+                    import traceback
+                    traceback.print_exc()
 
             # Use placeholders to ensure loops run at least once, even if no values are specified
             iter_exps = experiments if experiments else [None]
@@ -795,6 +1183,8 @@ def run():
                             search_criteria=search_criteria,
                             meta_criteria=META_CRITERIA_CONFIG,
                             API=API,
+                            symmetrical=symmetrical,
+                            symmetrical_sources_cache=symmetrical_sources_cache,
                         )
                     except KeyboardInterrupt:
                         rich_print("[yellow]Processing interrupted by user.[/yellow]")
@@ -809,34 +1199,32 @@ def run():
                 if _shutdown_requested.is_set():
                     break
 
-            # # Check if regridding should run (only if not interrupted)
-            # if not _shutdown_requested.is_set() and META_CRITERIA_CONFIG.get(
-            #     "regrid", False
-            # ):
-            #     rich_print("[blue]Regridding enabled, running regridding...[/blue]")
-            #     try:
-            #         regrid.RegridderManager(
-            #             fs=API.esg.fs,
-            #             watch_dir=API.esg.fs.data,
-            #         )
-            #     except KeyboardInterrupt:
-            #         rich_print("[yellow]Regridding interrupted by user.[/yellow]")
-            #     except Exception as e:
-            #         rich_print(f"[red]Regridding failed: {e}[/red]")
+            # Run post-download regridding if configured
+            if not _shutdown_requested.is_set() and META_CRITERIA_CONFIG.get("regrid", False):
+                rich_print("[cyan]Regridding enabled, running regridding...[/cyan]")
+                try:
+                    from esgpull.esgpullplus.cdo_regrid import regrid_directory
+                    target_res = META_CRITERIA_CONFIG.get("regrid_resolution", (1.0, 1.0))
+                    if isinstance(target_res, (list, tuple)) and len(target_res) == 2:
+                        target_res = tuple(target_res)
+                    else:
+                        target_res = (1.0, 1.0)
+                    regrid_input = Path(META_CRITERIA_CONFIG["data_dir"]) if META_CRITERIA_CONFIG.get("data_dir") else API.esg.fs.paths.data
+                    regrid_directory(
+                        input_dir=regrid_input,
+                        include_subdirectories=True,
+                        target_resolution=target_res,
+                        max_workers=META_CRITERIA_CONFIG.get("max_workers", 4),
+                    )
+                except KeyboardInterrupt:
+                    rich_print("[yellow]Regridding interrupted by user.[/yellow]")
+                except Exception as e:
+                    rich_print(f"[red]Regridding failed: {e}[/red]")
 
-            # if _shutdown_requested.is_set():
-            #     rich_print(
-            #         "\n[bold green]✅ Graceful shutdown completed successfully.[/bold green]"
-            #     )
-            #     rich_print(
-            #         "[dim]All downloads stopped cleanly. No data was lost.[/dim]"
-            #     )
-            # else:
-            #     rich_print(
-            #         "\n[bold green]✅ Processing completed successfully.[/bold green]"
-            #     ) if META_CRITERIA_CONFIG["process"] else rich_print(
-            #         "\n[bold green]✅ No processing executed (none specified).[/bold green]"
-            #     )
+            if _shutdown_requested.is_set():
+                rich_print("\n[bold green]Graceful shutdown completed.[/bold green]")
+            else:
+                rich_print("\n[bold green]Processing completed successfully.[/bold green]")
 
         except KeyboardInterrupt:
             rich_print("[yellow]Main process interrupted.[/yellow]")
