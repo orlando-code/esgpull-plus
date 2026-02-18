@@ -34,23 +34,16 @@ from esgpull.esgpullplus import config
 
 
 class RegridProgressUI:
-    """Compact progress UI for regridding operations with minimal visual clutter."""
+    """Progress UI for regridding: one progress bar per file (like download UI)."""
 
-    def __init__(self, files: List[Path], verbose: bool = True):
+    def __init__(self, files: List[Path], verbose: bool = True, verbose_diagnostics: bool = False):
         self.files = files
         self.verbose = verbose
+        self.verbose_diagnostics = verbose_diagnostics
         self.console = Console()
-        
-        # Status tracking
-        self.status_counts = {
-            "completed": 0,
-            "skipped": 0,
-            "failed": 0,
-        }
-        
-        # File tracking
+        self.status_counts = {"completed": 0, "skipped": 0, "failed": 0}
         self.file_status: Dict[Path, str] = {}
-        self.file_task_ids: Dict[Path, Optional[int]] = {}  # Track task IDs for each file
+        self.file_task_ids: Dict[Path, Optional[int]] = {}
         self.failed_files: List[tuple[Path, str]] = []
         self.processing_stats: Dict[str, Any] = {
             "weights_reused": 0,
@@ -59,12 +52,8 @@ class RegridProgressUI:
             "total_size_gb": 0.0,
             "memory_peak_gb": 0.0,
         }
-        
-        # Compact display
         self.overall_task: Optional[int] = None
-        self.current_files: List[Path] = []  # Currently processing files
-        self.max_concurrent_display = 3  # Max files to show at once
-        
+        self.current_files: List[Path] = []
         self._setup_logger()
         self._setup_progress()
 
@@ -106,52 +95,52 @@ class RegridProgressUI:
         )
 
     def __enter__(self):
-        """Enter the progress context."""
+        """Enter the progress context. Only overall task is added; per-file tasks added when each file starts."""
         self.progress.__enter__()
-        
-        # Add overall progress task
         file_str = "files" if len(self.files) > 1 else "file"
         self.overall_task = self.progress.add_task(
             f"[cyan]Regridding {len(self.files)} {file_str}[/cyan]",
-            total=len(self.files)
+            total=len(self.files),
         )
-        
-        # Initialize file statuses
         for file_path in self.files:
             self.file_status[file_path] = "PENDING"
-        
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Exit the progress context."""
         self.progress.__exit__(exc_type, exc_val, exc_tb)
 
-    def start_file_processing(self, file_path: Path, file_info: Dict[str, Any]):
-        """Start processing a file with compact display."""
+    def start_file_processing(
+        self,
+        file_path: Path,
+        file_info: Dict[str, Any],
+        regrid_mode: str = "complete",
+    ):
+        """Add a progress bar for this file (only current batch visible). regrid_mode: 'surface', 'seafloor', or 'complete'."""
         self.current_files.append(file_path)
         self.file_status[file_path] = "PROCESSING"
-        
-        # Only show detailed info for first few files or if verbose
-        if len(self.current_files) <= self.max_concurrent_display or self.verbose:
-            filename = file_path.name
-            size_gb = file_info.get('file_size_gb', 0)
-            grid_type = file_info.get('grid_type', 'unknown')
-            
-            # Create compact task description
-            desc = f"[blue]{filename}[/blue] ({size_gb:.1f}GB, {grid_type})"
-            task_id = self.progress.add_task(desc, total=100)
-            self.file_task_ids[file_path] = task_id
+        filename = file_path.name
+        mode_str = f" ({regrid_mode})"
+        if self.verbose_diagnostics:
+            size_gb = file_info.get("file_size_gb", 0)
+            grid_type = file_info.get("grid_type", "unknown")
+            desc = f"[blue]{filename}{mode_str}[/blue] ({size_gb:.1f}GB, {grid_type})"
         else:
-            # For many files, just track without individual progress bars
-            self.file_task_ids[file_path] = None
+            desc = f"[blue][PENDING]{mode_str} {filename}[/blue]"
+        task_id = self.progress.add_task(desc, total=100, visible=True)
+        self.file_task_ids[file_path] = task_id
 
-    def update_file_progress(self, file_path: Path, progress: int, operation: str = ""):
+    def update_file_progress(
+        self, file_path: Path, progress: int, operation: str = "", regrid_mode: str = "complete"
+    ):
         """Update progress for a specific file."""
-        if file_path in self.file_task_ids and self.file_task_ids[file_path] is not None:
-            task_id = self.file_task_ids[file_path]
-            filename = file_path.name
-            desc = f"[blue]{operation}: {filename}[/blue]" if operation else f"[blue]{filename}[/blue]"
-            self.progress.update(task_id, completed=progress, description=desc)
+        task_id = self.file_task_ids.get(file_path)
+        if task_id is None:
+            return
+        filename = file_path.name
+        mode_str = f" ({regrid_mode})"
+        desc = f"[blue]{operation}: {filename}{mode_str}[/blue]" if operation else f"[blue]{filename}{mode_str}[/blue]"
+        self.progress.update(task_id, completed=progress, description=desc)
 
     def complete_file(self, file_path: Path, success: bool = True, message: str = ""):
         """Mark a file as completed with compact display."""
@@ -170,25 +159,14 @@ class RegridProgressUI:
                 self.failed_files.append((file_path, message))
                 self.logger.error(f"File: {file_path.name} - {message}")
         
-        # Update individual progress bar if it exists
-        if file_path in self.file_task_ids and self.file_task_ids[file_path] is not None:
-            task_id = self.file_task_ids[file_path]
+        task_id = self.file_task_ids.get(file_path)
+        if task_id is not None:
             filename = file_path.name
             if success:
-                self.progress.update(
-                    task_id,
-                    completed=100,
-                    description=f"[green]✓ {filename}[/green]"
-                )
+                self.progress.update(task_id, completed=100, description=f"[green]✓ {filename}[/green]")
             else:
-                self.progress.update(
-                    task_id,
-                    completed=100,
-                    description=f"[red]✗ {filename}[/red]"
-                )
-            # Hide after short delay
-            self._hide_file_after_delay(file_path, 1)
-        
+                self.progress.update(task_id, completed=100, description=f"[red]✗ {filename}[/red]")
+            self._hide_task_after_delay(task_id, delay_seconds=2)
         # Advance overall progress
         if self.overall_task is not None:
             self.progress.advance(self.overall_task)
@@ -205,24 +183,28 @@ class RegridProgressUI:
         self.file_status[file_path] = "SKIPPED"
         self.status_counts["skipped"] += 1
         
-        # Update individual progress bar if it exists
-        if file_path in self.file_task_ids and self.file_task_ids[file_path] is not None:
-            task_id = self.file_task_ids[file_path]
+        task_id = self.file_task_ids.get(file_path)
+        if task_id is not None:
             filename = file_path.name
-            self.progress.update(
-                task_id,
-                completed=100,
-                description=f"[yellow]⏭ {filename}[/yellow]"
-            )
-            # Hide after short delay
-            self._hide_file_after_delay(file_path, 1)
-        
+            self.progress.update(task_id, completed=100, description=f"[yellow]⏭ {filename}[/yellow]")
+            self._hide_task_after_delay(task_id, delay_seconds=2)
         # Advance overall progress
         if self.overall_task is not None:
             self.progress.advance(self.overall_task)
             
         # Update overall progress description
         self._update_overall_description()
+
+    def _hide_task_after_delay(self, task_id: int, delay_seconds: int = 2):
+        """Hide a task after a delay so only the current batch remains visible."""
+        import threading
+        def hide():
+            time.sleep(delay_seconds)
+            try:
+                self.progress.update(task_id, visible=False)
+            except Exception:
+                pass
+        threading.Thread(target=hide, daemon=True).start()
 
     def _update_overall_description(self):
         """Update the overall progress description with current statistics."""
@@ -244,46 +226,27 @@ class RegridProgressUI:
 
     def update_chunking_progress(self, file_path: Path, chunk_num: int, total_chunks: int):
         """Update progress for chunked file processing."""
-        if file_path in self.file_task_ids and self.file_task_ids[file_path] is not None:
-            task_id = self.file_task_ids[file_path]
+        task_id = self.file_task_ids.get(file_path)
+        if task_id is not None:
             progress = int((chunk_num / total_chunks) * 100)
             filename = file_path.name
             self.progress.update(
                 task_id,
                 completed=progress,
-                description=f"[cyan]Chunking {filename} ({chunk_num}/{total_chunks})[/cyan]"
+                description=f"[cyan]Chunking {filename} ({chunk_num}/{total_chunks})[/cyan]",
             )
 
     def update_regridding_progress(self, file_path: Path, operation: str):
         """Update progress for regridding operations."""
-        if file_path in self.file_task_ids and self.file_task_ids[file_path] is not None:
-            task_id = self.file_task_ids[file_path]
+        task_id = self.file_task_ids.get(file_path)
+        if task_id is not None:
             filename = file_path.name
-            self.progress.update(
-                task_id,
-                description=f"[magenta]{operation}: {filename}[/magenta]"
-            )
+            self.progress.update(task_id, description=f"[magenta]{operation}: {filename}[/magenta]")
 
     def _update_stats(self, stats: Dict[str, Any]):
         """Update processing statistics."""
         self.processing_stats.update(stats)
 
-
-    def _hide_file_after_delay(self, file_path: Path, delay_seconds: int):
-        """Hide file progress bar after a delay."""
-        import threading
-        
-        def hide_file():
-            time.sleep(delay_seconds)
-            try:
-                if file_path in self.file_task_ids and self.file_task_ids[file_path] is not None:
-                    task_id = self.file_task_ids[file_path]
-                    self.progress.update(task_id, visible=False)
-            except Exception:
-                pass
-        
-        thread = threading.Thread(target=hide_file, daemon=True)
-        thread.start()
 
     def print_summary(self):
         """Print a comprehensive summary of the regridding operation."""
@@ -351,21 +314,24 @@ class RegridProgressUI:
 
 
 class BatchRegridUI:
-    """Compact UI for batch regridding operations with parallel processing support."""
+    """Batch regridding UI: only files in the current batch shown at once; overall progress."""
 
-    def __init__(self, files: List[Path], max_workers: int = 4, verbose: bool = True):
+    def __init__(
+        self,
+        files: List[Path],
+        max_workers: int = 4,
+        verbose: bool = True,
+        regrid_mode: str = "complete",
+    ):
         self.files = files
         self.max_workers = max_workers
         self.verbose = verbose
+        self.regrid_mode = regrid_mode
         self.console = Console()
-        
-        # Progress tracking
         self.overall_progress: Optional[int] = None
         self.completed_files: List[Path] = []
         self.failed_files: List[tuple[Path, str]] = []
         self.skipped_files: List[Path] = []
-        
-        # Statistics
         self.stats = {
             "files_processed": 0,
             "weights_reused": 0,
@@ -374,12 +340,12 @@ class BatchRegridUI:
             "errors": 0,
             "total_size_gb": 0.0,
             "memory_peak_gb": 0.0,
+            "processing_time": "0s",
         }
-        
         self._setup_progress()
 
     def _setup_progress(self):
-        """Set up compact progress display for batch operations."""
+        """Set up progress display: overall + one bar per file."""
         self.progress = Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -391,38 +357,51 @@ class BatchRegridUI:
             transient=False,
             expand=True,
             auto_refresh=True,
-            refresh_per_second=2,  # Reduced refresh rate
+            refresh_per_second=2,
         )
 
     def __enter__(self):
-        """Enter the batch progress context."""
+        """Enter the batch progress context. Per-file tasks added only when each completes (so only current batch visible)."""
         self.progress.__enter__()
-        
-        # Add overall progress task with worker info
-        desc = f"[cyan]Batch Regridding {len(self.files)} files ({self.max_workers} workers)[/cyan]"
+        mode_str = f" ({self.regrid_mode})"
+        desc = f"[cyan]Batch Regridding {len(self.files)} files{mode_str} ({self.max_workers} workers)[/cyan]"
         self.overall_progress = self.progress.add_task(desc, total=len(self.files))
-        
         return self
+
+    def _hide_task_after_delay(self, task_id: int, delay_seconds: int = 2):
+        """Hide a task after a delay so only the current batch remains visible."""
+        import threading
+        def hide():
+            time.sleep(delay_seconds)
+            try:
+                self.progress.update(task_id, visible=False)
+            except Exception:
+                pass
+        threading.Thread(target=hide, daemon=True).start()
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Exit the batch progress context."""
         self.progress.__exit__(exc_type, exc_val, exc_tb)
 
     def update_file_result(self, file_path: Path, result: Dict[str, Any]):
-        """Update progress based on file processing result."""
-        if result.get('success', False):
-            if result.get('skipped', False):
+        """Update progress; show this file briefly (✓/⏭/✗) with mode then hide so only current batch visible."""
+        name = file_path.name
+        mode_str = f" ({self.regrid_mode})"
+        if result.get("success", False):
+            if result.get("skipped", False):
                 self.skipped_files.append(file_path)
+                desc = f"[yellow]⏭ {name}{mode_str}[/yellow]"
             else:
                 self.completed_files.append(file_path)
+                desc = f"[green]✓ {name}{mode_str}[/green]"
         else:
-            error_msg = result.get('message', 'Unknown error')
+            error_msg = result.get("message", "Unknown error")
             self.failed_files.append((file_path, error_msg))
-        
-        # Advance progress
-        self.progress.advance(self.overall_progress)
-        
-        # Update overall description with current stats
+            desc = f"[red]✗ {name}{mode_str}[/red]"
+        task_id = self.progress.add_task(desc, total=1, completed=1, visible=True)
+        self._hide_task_after_delay(task_id, delay_seconds=2)
+        if self.overall_progress is not None:
+            self.progress.advance(self.overall_progress)
         self._update_overall_description()
         
         # Update statistics
@@ -449,12 +428,19 @@ class BatchRegridUI:
 
     def _update_stats(self, new_stats: Dict[str, Any]):
         """Update cumulative statistics."""
+        # print("here3")
+        # print(new_stats)
         for key, value in new_stats.items():
             if key in self.stats:
                 if isinstance(value, (int, float)):
                     self.stats[key] += value
                 else:
+                    # print("here4")
+                    # print(key)
+                    # print(value)
                     self.stats[key] = value
+            else:
+                self.stats[key] = value # add new key to stats dictionary
 
     def print_summary(self):
         """Print compact batch processing summary."""
@@ -489,6 +475,9 @@ class BatchRegridUI:
         # Add timing information if available
         if "processing_time" in self.stats:
             stats_table.add_row("Processing Time", self.stats["processing_time"])
+        else:
+            print("No processing time available")
+            print(self.stats)
         
         self.console.print(Panel(table, title="[bold]Batch Regridding Summary[/bold]", border_style="green"))
         self.console.print(Panel(stats_table, title="[bold]Processing Statistics[/bold]", border_style="cyan"))
