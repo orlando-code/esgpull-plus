@@ -67,6 +67,16 @@ class IndexNode:
         return result
 
 
+def quote_str(s: str) -> str:
+    if "*" in s:
+        # don't quote when `*` is present, quotes enforce exact match
+        return s
+    elif not s.startswith('"') and not s.endswith('"'):
+        return f'"{s}"'
+    else:
+        return s
+
+
 @dataclass
 class Result:
     query: Query
@@ -123,16 +133,42 @@ class Result:
         #     query["end"] = format_date_iso(str(facets.pop("end")))
         solr_terms: list[str] = []
         for name, values in self.query.selection.items():
-            value_term = " ".join(values)
-            if name == "query":  # freetext case
-                solr_terms.append(value_term)
-            else:
-                if len(values) > 1:
-                    value_term = f"({value_term})"
-                if name.startswith("!"):
+            if index.is_bridge():
+                if name == "query":
+                    solr_terms.append(" ".join(values))
+                elif name.startswith("!"):
+                    value_term = " ".join(quote_str(v) for v in values)
+                    if len(values) > 1:
+                        value_term = f"({value_term})"
                     solr_terms.append(f"NOT ({name[1:]}:{value_term})")
                 else:
-                    solr_terms.append(f"{name}:{value_term}")
+                    has_wildcard = any("*" in v for v in values)
+                    no_wildcard = any("*" not in v for v in values)
+                    if has_wildcard and no_wildcard:
+                        logger.warning(
+                            (
+                                f"Facet {name} has mixed wildcard/non-wildcard values. "
+                                "Non-wildcard values may match partially."
+                            )
+                        )
+                    value_term = " ".join(quote_str(v) for v in values)
+                    if len(values) > 1:
+                        value_term = f"({value_term})"
+                    if has_wildcard:
+                        solr_terms.append(f"{name}:{value_term}")
+                    else:
+                        params[name] = ",".join(values)
+            else:
+                value_term = " ".join(values)
+                if name == "query":
+                    solr_terms.append(value_term)
+                else:
+                    if len(values) > 1:
+                        value_term = f"({value_term})"
+                    if name.startswith("!"):
+                        solr_terms.append(f"NOT ({name[1:]}:{value_term})")
+                    else:
+                        solr_terms.append(f"{name}:{value_term}")
         if solr_terms:
             params["query"] = " AND ".join(solr_terms)
         for name, option in self.query.options.items(use_default=True):
@@ -241,6 +277,10 @@ class ResultSearchAsQueries(Result):
 
 
 def _distribute_hits_impl(hits: list[int], max_hits: int) -> list[int]:
+    if not hits:
+        return []
+    if sum(hits) == 0:
+        return [0] * len(hits)
     i = total = 0
     N = len(hits)
     accs = [0.0 for _ in range(N)]
@@ -511,6 +551,8 @@ class Context:
             result.process()
             if result.processed:
                 hits.append(result.data)
+            else:
+                hits.append(0)
         return hits
 
     async def _hints(self, *results: ResultHints) -> list[HintsDict]:
