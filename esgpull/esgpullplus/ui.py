@@ -96,9 +96,9 @@ class DownloadProgressUI:
         self.file_status[fname] = status
         if status == "DONE":
             self.status_counts["done"] += 1
-        elif status == "SKIPPED":
+        elif status in ("SKIPPED", "SKIP"):
             self.status_counts["skipped"] += 1
-        elif status == "FAIL":
+        elif status in ("FAIL", "FAILED", "ERROR", "TIMEOUT"):
             self.status_counts["failed"] += 1
         # else:
         #     print(status)
