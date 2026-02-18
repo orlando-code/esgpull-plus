@@ -89,6 +89,36 @@ class EnhancedFile(Base):
         Base.compute_sha(self)
 
     @classmethod
+    def _extract_url(cls, source: dict, dataset_id: str, filename: str) -> str:
+        """
+        Extract HTTP(S) download URL from ESGF Solr doc.
+        Handles multi-valued url (one per service), prefers HTTPServer.
+        Falls back to constructing THREDDS URL when url field is empty.
+        """
+        raw = source.get("url") or source.get("urls")
+        if raw is None:
+            raw = []
+        if not isinstance(raw, list):
+            raw = [raw] if raw else []
+        for entry in raw:
+            s = find_str(entry) if isinstance(entry, (list, str)) else str(entry)
+            if not s:
+                continue
+            # Format: url|mime|service
+            url_part = s.partition("|")[0].strip()
+            if url_part and ("http://" in s or "https://" in s or "HTTPServer" in s):
+                url_part = url_part.replace("http://", "https://")
+                if url_part.startswith("http"):
+                    return url_part
+        # Fallback: construct THREDDS URL from data_node, dataset_id, filename
+        data_node = find_str(source.get("data_node", ""))
+        if data_node and dataset_id and filename:
+            # CMIP6 path: project/activity/institution/model/.../version/filename
+            path = dataset_id.replace(".", "/")
+            return f"https://{data_node}/thredds/fileServer/esg_dataroot/{path}/{filename}"
+        return ""
+
+    @classmethod
     def serialize(cls, source: dict) -> 'EnhancedFile':
         """
         Enhanced serialize method that captures all available metadata from ESGF search results.
@@ -96,10 +126,12 @@ class EnhancedFile(Base):
         """
         # Extract base file fields (same as original File.serialize)
         # Handle cases where fields might be missing or in different formats
-        dataset_id = find_str(source.get("dataset_id", "")).partition("|")[0]
+        dataset_id = find_str(source.get("dataset_id", source.get("instance_id", ""))).partition("|")[0]
         filename = find_str(source.get("title", ""))
-        url = find_str(source.get("url", "")).partition("|")[0]
-        url = url.replace("http://", "https://")
+        if not filename and "." in dataset_id:
+            # instance_id format: dataset_id.filename
+            dataset_id, _, filename = dataset_id.rpartition(".")
+        url = cls._extract_url(source, dataset_id, filename)
         data_node = find_str(source.get("data_node", ""))
         checksum = find_str(source.get("checksum", ""))
         checksum_type = find_str(source.get("checksum_type", ""))
