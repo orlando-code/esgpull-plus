@@ -12,6 +12,7 @@ import sqlalchemy.orm
 from alembic.config import Config as AlembicConfig
 from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
+from alembic.util.exc import CommandError
 from sqlalchemy.inspection import inspect
 from sqlalchemy.orm import Session, joinedload, make_transient
 
@@ -64,11 +65,28 @@ class Database:
         alembic_config.attributes["connection"] = self._engine
         script = ScriptDirectory.from_config(alembic_config)
         head = script.get_current_head()
+        needs_head_upgrade = False
         with self._engine.begin() as conn:
             opts = {"version_table": "version"}
             ctx = MigrationContext.configure(conn, opts=opts)
-            self.version = ctx.get_current_revision()
-        if head is not None and self.version != head:
+            try:
+                self.version = ctx.get_current_revision()
+            except CommandError as e:
+                if "more than one head" in str(e).lower():
+                    # Version table has multiple heads (e.g. from interrupted merge).
+                    # Stamp to head to consolidate; upgrade would fail with "overlaps" error.
+                    needs_head_upgrade = True
+                else:
+                    raise
+        if needs_head_upgrade and head is not None:
+            try:
+                alembic.command.upgrade(alembic_config, "head")
+            except Exception:
+                # Upgrade can fail with "overlaps" when version table is inconsistent.
+                # Stamp to head to force version table to a single revision.
+                alembic.command.stamp(alembic_config, "head")
+            self.version = head
+        elif head is not None and self.version != head:
             alembic.command.upgrade(alembic_config, head)
             self.version = head
         if "+dev" not in __version__ and self.version != __version__:
