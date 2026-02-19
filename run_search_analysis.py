@@ -48,15 +48,10 @@ def main():
     )
     parser.add_argument(
         "--require-both",
+        dest="require_both",
         action="store_true",
         default=True,
         help="Only analyze sources with both historical and SSP experiments (default: True)",
-    )
-    parser.add_argument(
-        "--no-require-both",
-        dest="require_both",
-        action="store_false",
-        help="Include sources even if they don't have both historical and SSP experiments",
     )
     parser.add_argument(
         "--config-path",
