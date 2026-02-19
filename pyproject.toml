@@ -93,8 +93,13 @@ doc = { shell = "cd docs && mkdocs serve", help = "Start doc server" }
 [tool.pytest.ini_options]
 minversion = "6.2.4"
 filterwarnings = ["ignore::DeprecationWarning"]
-markers = ["slow: mark test as slow to run"]
-addopts = "-r aR -n auto --cov=esgpull --cov-config=pyproject.toml --cov-report term-missing:skip-covered --mypy"
+markers = [
+    "slow: mark test as slow to run",
+    "asyncio: mark test as an asyncio coroutine (pytest-asyncio)",
+    "network: mark test as requiring network access (skip when offline)",
+]
+# Minimal addopts so tests run without pytest-cov/pytest-mypy. CI can add e.g. --cov=esgpull -n auto
+addopts = "-ra -q"
 testpaths = ["tests/"]
 
 [tool.ruff]
