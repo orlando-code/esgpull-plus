@@ -92,6 +92,8 @@ If upstream is missing: `git remote add upstream https://github.com/ESGF/esgf-do
 ---
 ## Searching for data
 
+### Main search
+
 Populate the `search.yaml` file (in the repo root) with your ESGF [facets](https://esgf.github.io/esg-search/ESGF_Search_RESTful_API.html) and meta options:
 
 ```yaml
@@ -120,17 +122,35 @@ python -m esgpull.esgpullplus.api --symmetrical  # only download sources with bo
 - **Sorting by resolution:** search results are converted to a DataFrame and sorted by parsed nominal horizontal resolution, then by `dataset_id`, so you always get a consistent “highest resolution first” ordering.
 - **Stable IDs:** multi-value facets like `variable: uo,vo` are normalised (split, trimmed, sorted) so the order you write them in `search.yaml` does not affect the generated search IDs or caching.
 
-Key inputs:
+**Inputs (YAML keys):**
 
-- **`search_criteria`**: ESGF facets (project, table_id, experiment_id, variable/variable_id, frequency, etc.) plus:
-  - **`filter.top_n`**: number of top grouped datasets to keep.
-  - **`filter.limit`**: maximum number of results returned per sub-search (useful for debugging).
-- **`meta_criteria`**:
-  - **`data_dir`**: where downloaded data and search results are stored.
-  - **`test`**: dry-run / testing behaviours (see code for details).
-  - **`regrid`** (bool): if true, run post-download regridding using `cdo_regrid`.
-  - **`regrid_resolution`**: pair `[lon_res, lat_res]` used for that post-download regridding.
-  - **`max_workers`**: worker count used for any post-download regridding.
+| Key | Description |
+|-----|-------------|
+| `search_criteria.*` | ESGF facets (project, table_id, experiment_id, variable/variable_id, frequency, etc.). |
+| `search_criteria.filter.top_n` | Number of top grouped datasets to keep. |
+| `search_criteria.filter.limit` | Maximum number of results per sub-search (useful for debugging). |
+| `meta_criteria.data_dir` | Base directory for downloaded data and cached search results. |
+| `meta_criteria.max_workers` | Worker count used for any post-download regridding. |
+
+### Search analysis script
+
+`run_search_analysis` runs an ESGF search from `search.yaml`, analyzes source availability (which sources have both historical and SSP experiments, resolutions, ensemble counts), and optionally writes an `analysis_df.csv` plus PNG plots. It ignores `filter.top_n` and `filter.limit` so the analysis uses all matching results.
+
+**Run:**
+
+```bash
+python run_search_analysis.py [OPTIONS]
+```
+
+| Option | Default | Description |
+|--------|--------|-------------|
+| `--config` / `--config-path` | `search.yaml` | Path to search config YAML. |
+| `--output-dir` | `plots/` (repo) | Directory for `analysis_df.csv` and plot PNGs. |
+| `--save-plots` | True | Save plot images (source availability heatmap, ensemble counts, resolution distribution, summary table). |
+| `--show-plots` | True | Display plots interactively; pass `--show-plots` to disable. |
+| `--require-both` | True | Only include sources that have both historical and SSP experiments. |
+
+**Outputs:** `analysis_df.csv` plus, when `--save-plots` is on, `source_availability_heatmap.png`, `ensemble_counts.png`, `resolution_distribution.png`, `source_summary_table.png` in the output directory. Requires `matplotlib` and `seaborn` for plotting.
 
 ---
 ## CDO regridding pipeline
@@ -153,9 +173,33 @@ python -m esgpull.esgpullplus.cdo_regrid /path/to/dir --extreme-levels
 python -m esgpull.esgpullplus.cdo_regrid /path/to/file.nc -o /path/to/out.nc --extract-seafloor
 ```
 
-**Options (summary):** `-o/--output`, `-r/--resolution` (lon lat), `-p/--pattern`, `--extract-surface`, `--extract-seafloor`, `--extreme-levels`, `--no-regrid-cache`, `--no-seafloor-cache`, `-w/--max-workers`, `--chunk-size-gb`, `--no-parallel`, `--overwrite`, `--quiet`.
+**Options:**
 
-N.B. if `output` not specified, new file will be written to the same directory.
+| Option | Default | Description |
+|--------|---------|-------------|
+| `input` (positional) | required | Input file or directory. |
+| `-o`, `--output` | same as input dir | Output file or directory; if omitted, writes next to input. |
+| `-r`, `--resolution lon lat` | `1.0 1.0` | Target output resolution (lon_res, lat_res). |
+| `-p`, `--pattern` | `"*.nc"` | File pattern when `input` is a directory. |
+| `--include-subdirectories` | `True` | Include subdirectories when walking a directory. |
+| `--extract-surface` | `False` | Extract and regrid only the top level (surface). |
+| `--extract-seafloor` | `False` | Extract and regrid only seafloor values. |
+| `--extreme-levels` | `False` | Regrid both surface and seafloor for each file. |
+| `--no-regrid-cache` | `False` | Disable reuse of CDO weight files. |
+| `--no-seafloor-cache` | `False` | Disable reuse of seafloor depth index cache. |
+| `-w`, `--max-workers` | `4` | Maximum parallel workers. |
+| `--chunk-size-gb` | `2.0` | Maximum time-chunk size in GB. |
+| `--max-memory-gb` | `8.0` | Soft cap for memory-aware chunking. |
+| `--no-parallel` | `False` | Process files sequentially. |
+| `--no-chunking` | `False` | Disable time chunking (process files in one go). |
+| `-v`, `--verbose` | `True` | Verbose progress UI. |
+| `--verbose-max` | `False` | Extra diagnostics (grid type, size, large file messages). |
+| `--quiet` | `False` | Disable verbose output. |
+| `--use-ui` | `True` | Use the rich progress UI. |
+| `--unlink-unprocessed` | `False` | Remove any files that could not be processed. |
+| `--overwrite` | `False` | Overwrite existing output files. |
+
+N.B. if `--output` is not specified, new files will be written to the same directory as the inputs.
 
 ### File watcher regridding
 
@@ -169,19 +213,26 @@ python -m esgpull.esgpullplus.file_watcher /path/to/watch \
   --process-existing    # also process files that are already present
 ```
 
-Important arguments:
+**Options:**
 
-- **`watch_dir`** (positional): directory to watch.
-- **`--target-resolution lon lat`**: target grid resolution (default `1.0 1.0`).
-- **`--target-grid`**: CDO target grid type (default `lonlat`).
-- **`--weight-cache-dir`**: directory for regrid weights (if omitted, uses per-data-dir cache).
-- **`--max-workers`**: maximum parallel workers.
-- **`--batch-size` / `--batch-timeout`**: how many files to accumulate and how long to wait before triggering a batch regrid.
-- **`--extract-surface` / `--extract-seafloor`**: process only top level, only seafloor, or both if used together with other tools.
-- **`--use-regrid-cache` / `--use-seafloor-cache`**: enable weight and seafloor-depth caching.
-- **`--file-settle-seconds`**: wait time to ensure files are no longer being written before processing.
-- **`--validate-can-open`**: check that files can be opened before scheduling regridding.
-- **`--overwrite` / `--delete-original` / `--process-existing`**: control whether outputs overwrite, whether originals are removed, and whether pre-existing files are processed on startup.
+| Option | Default | Description |
+|--------|---------|-------------|
+| `watch_dir` (positional) | required | Directory to watch for new NetCDF files. |
+| `-r`, `--target-resolution lon lat` | `1.0 1.0` | Target output resolution (lon_res, lat_res). |
+| `--target-grid` | `"lonlat"` | CDO target grid type. |
+| `--weight-cache-dir` | `None` | Directory to store/reuse CDO weight files. |
+| `--max-workers` | `4` | Maximum parallel workers. |
+| `--batch-size` | `10` | Maximum files to accumulate before triggering a batch regrid. |
+| `--batch-timeout` | `30.0` | Maximum seconds to wait before processing a partial batch. |
+| `--extract-surface` | `False` | Extract and regrid only the top level (surface). |
+| `--extract-seafloor` | `False` | Extract and regrid only seafloor values. |
+| `--use-regrid-cache` | `False` | Enable reuse of CDO weight files. |
+| `--use-seafloor-cache` | `False` | Enable reuse of seafloor depth index cache. |
+| `--file-settle-seconds` | `10.0` | Wait time to ensure files are no longer being written before processing. |
+| `--validate-can-open` | `True` | Validate that files can be opened before scheduling regridding. |
+| `--overwrite` | `False` | Overwrite existing regridded outputs. |
+| `--delete-original` | `False` | Delete original files after successful regridding. |
+| `--process-existing` | `True` | Process files already present in `watch_dir` on startup. |
 
 ### Python API
 
