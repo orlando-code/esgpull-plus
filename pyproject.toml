@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "esgpull-plus"
-version = "0.0.3"
+version = "1.0.0"
 classifiers = [
     "License :: OSI Approved :: BSD License",
     "Programming Language :: Python :: 3",
@@ -15,7 +15,7 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
 ]
-description = "Extension of the original ESGF data discovery, download, replication package, esgpull"
+description = "Extension of the original ESGF data discovery and download adding config file-based downloading and advanced regridding/subsetting functionality"
 authors = [{ name = "Orlando Timmerman", email = "rt582@cam.ac.uk" }]
 readme = "README.md"
 requires-python = ">=3.10"
