@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 from esgpull import Esgpull
@@ -10,7 +11,8 @@ from esgpull.cli.update import update
 from esgpull.config import Config
 
 
-def test_update_after_remove(root: Path, config: Config):
+@pytest.mark.network
+def test_update_after_remove(root: Path, config: Config, require_network):
     config.generate(overwrite=True)
     runner = CliRunner()
     result_config = runner.invoke(config_cmd, ["api.page_limit", "10000"])

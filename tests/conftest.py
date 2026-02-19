@@ -1,3 +1,4 @@
+import socket
 from pathlib import Path
 
 import pytest
@@ -7,6 +8,22 @@ from esgpull.constants import CONFIG_FILENAME
 from esgpull.install_config import InstallConfig
 from esgpull.models import File, FileStatus
 from tests.utils import CEDA_NODE
+
+
+def esgf_reachable(timeout: float = 3.0) -> bool:
+    """Return True if ESGF (esgf.ceda.ac.uk) is reachable."""
+    try:
+        socket.create_connection(("esgf.ceda.ac.uk", 443), timeout=timeout)
+        return True
+    except (OSError, socket.gaierror):
+        return False
+
+
+@pytest.fixture
+def require_network():
+    """Skip the test if ESGF is not reachable (for tests marked @pytest.mark.network)."""
+    if not esgf_reachable():
+        pytest.skip("ESGF unreachable (esgf.ceda.ac.uk)")
 
 
 @pytest.fixture
