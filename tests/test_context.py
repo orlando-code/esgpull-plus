@@ -47,7 +47,8 @@ def test_multi_index(ctx, empty):
         assert index_node == result.request.headers["host"]
 
 
-def test_adjust_hits(ctx):
+@pytest.mark.network
+def test_adjust_hits(ctx, require_network):
     variable_ids = ["tas", "tasmin"]
     queries = []
     for variable_id in variable_ids:
@@ -156,7 +157,8 @@ class Timer:
 #     logging.info(f"{t_distributed.duration}")
 
 
-def test_ipsl_hits_exist(ctx, cmip6_ipsl):
+@pytest.mark.network
+def test_ipsl_hits_exist(ctx, require_network, cmip6_ipsl):
     hits = ctx.hits(
         cmip6_ipsl,
         file=False,
@@ -165,12 +167,14 @@ def test_ipsl_hits_exist(ctx, cmip6_ipsl):
     assert 1_000 < hits[0]
 
 
-def test_more_files_than_datasets(ctx, query):
+@pytest.mark.network
+def test_more_files_than_datasets(ctx, require_network, query):
     assert sum(ctx.hits(query, file=False)) < sum(ctx.hits(query, file=True))
 
 
 @pytest.mark.slow
-def test_hints(ctx, cmip6_ipsl):
+@pytest.mark.network
+def test_hints(ctx, require_network, cmip6_ipsl):
     facets = ["institution_id", "variable_id"]
     hints = ctx.hints(cmip6_ipsl, file=False, facets=facets)[0]
     assert list(hints["institution_id"]) == cmip6_ipsl.selection.institution_id
@@ -183,6 +187,7 @@ def test_hits_from_hints(ctx):
     assert hits == [6]
 
 
+@pytest.mark.network
 @pytest.mark.parametrize(
     "query_all",
     [
@@ -191,7 +196,7 @@ def test_hits_from_hints(ctx):
         Query(selection={"experiment_id": "ssp*", "variable_id": "tas"}),
     ],
 )
-def test_ignore_facet_hits(ctx, query_all: Query):
+def test_ignore_facet_hits(ctx, require_network, query_all: Query):
     query_ipsl = Query(selection={"institution_id": "IPSL"}) << query_all
     query_not_ipsl = Query(selection={"!institution_id": "IPSL"}) << query_all
     hits_all = ctx.hits(query_all, file=False)[0]

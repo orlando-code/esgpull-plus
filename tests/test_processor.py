@@ -165,11 +165,8 @@ async def run_task(task_):
     return result
 
 
-# @pytest.mark.xfail(
-#     raises=(httpx.ConnectTimeout, httpx.ReadTimeout),
-#     reason="this is dependent on the IPSL data node's health (unstable)",
-# )
-def test_task(fs, smallfile, task):
+@pytest.mark.network
+def test_task(fs, smallfile, task, require_network):
     result = asyncio.run(run_task(task))
     if not result.ok:
         raise result.err

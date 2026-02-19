@@ -3,8 +3,8 @@
 
 from esgpull.plugin import Event, on
 
-# Version compatibility
-MIN_ESGPULL_VERSION = "0.8.0"
+# Version compatibility (accept current esgpull-plus / esgpull version in this repo)
+MIN_ESGPULL_VERSION = "0.0.0"
 MAX_ESGPULL_VERSION = None
 
 

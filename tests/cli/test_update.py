@@ -1,6 +1,7 @@
 from pathlib import Path
-from time import perf_counter
+from time import perf_counter, sleep
 
+import pytest
 from click.testing import CliRunner
 
 from esgpull import Esgpull
@@ -33,7 +34,8 @@ def test_fast_update(config: Config):
     assert stop - start < 60  # 60 seconds to fetch ~4k files is plenty enough
 
 
-def test_update_updates_timestamp(root: Path, config: Config):
+@pytest.mark.network
+def test_update_updates_timestamp(root: Path, config: Config, require_network):
     config.generate(overwrite=True)
     runner = CliRunner()
     result_config = runner.invoke(config_cmd, ["api.page_limit", "10000"])
@@ -64,6 +66,9 @@ def test_update_updates_timestamp(root: Path, config: Config):
     query = esg.graph.get(query_id)
 
     initial_timestamp = query.updated_at
+
+    # Ensure clock advances so updated_at can be strictly greater (DB may use second precision)
+    sleep(2)
 
     # Run update with --yes to automatically add files
     result_update = runner.invoke(update, [query_id, "--yes"])

@@ -13,7 +13,8 @@ from esgpull.models import File, FileStatus, Query
 
 
 @pytest.mark.slow
-def test_update_displays_dataset_completion(root: Path, config: Config):
+@pytest.mark.network
+def test_update_displays_dataset_completion(root: Path, config: Config, require_network):
     """Test that show command displays dataset completion after update.
 
     Simple test: add query → update → check show displays "X / Y datasets"
@@ -50,6 +51,9 @@ def test_update_displays_dataset_completion(root: Path, config: Config):
 
     query_id = list(esg.graph._shas)[0]
     query = esg.graph.get(query_id)
+
+    if not query.has_files:
+        pytest.skip("Update fetched no files (ESGF returned no data)")
 
     tree_str = esg.ui.render(query._rich_tree())
 
