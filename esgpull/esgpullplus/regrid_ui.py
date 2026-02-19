@@ -36,7 +36,13 @@ from esgpull.esgpullplus import config
 class RegridProgressUI:
     """Progress UI for regridding: one progress bar per file (like download UI)."""
 
-    def __init__(self, files: List[Path], verbose: bool = True, verbose_diagnostics: bool = False):
+    def __init__(
+        self,
+        files: List[Path],
+        verbose: bool = True,
+        verbose_diagnostics: bool = False,
+        log_file: Optional[Path] = None,
+    ):
         self.files = files
         self.verbose = verbose
         self.verbose_diagnostics = verbose_diagnostics
@@ -54,26 +60,25 @@ class RegridProgressUI:
         }
         self.overall_task: Optional[int] = None
         self.current_files: List[Path] = []
-        self._setup_logger()
+        self._setup_logger(log_file)
         self._setup_progress()
 
-    def _setup_logger(self):
-        """Set up logging for regridding errors."""
+    def _setup_logger(self, log_file: Optional[Path] = None):
+        """Set up logging for regridding errors. Writes to log_file if given, else creates one under config.log_dir."""
         self.logger = logging.getLogger(f"regrid_errors_{id(self)}")
         self.logger.setLevel(logging.ERROR)
 
-        # Create logs directory
-        log_dir = config.log_dir
-        log_dir.mkdir(exist_ok=True)
+        if log_file is None:
+            log_dir = config.log_dir
+            log_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            log_file = log_dir / f"regrid_errors_{timestamp}.log"
+        self.log_file = Path(log_file)
+        self.log_file.parent.mkdir(parents=True, exist_ok=True)
 
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        log_file = log_dir / f"regrid_errors_{timestamp}.log"
-
-        handler = logging.FileHandler(log_file)
+        handler = logging.FileHandler(self.log_file)
         formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
         handler.setFormatter(formatter)
-
-        # Clear existing handlers and add the new one
         if self.logger.hasHandlers():
             self.logger.handlers.clear()
         self.logger.addHandler(handler)
