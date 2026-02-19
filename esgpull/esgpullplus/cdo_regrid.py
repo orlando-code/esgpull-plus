@@ -13,9 +13,16 @@ This module provides a complete regridding solution that:
 import hashlib
 import os
 import tempfile
+import uuid
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # Windows: no file locking; dedup only
 import shutil
 import multiprocessing as mp
 import psutil
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 import logging
@@ -104,6 +111,7 @@ def _process_single_file_standalone(
     overwrite: bool = False,
     representative_file: Optional[Path] = None,
     verbose: bool = False,
+    error_log_path: Optional[Path] = None,
 ) -> dict[str, any]:
     """
     Standalone function for processing a single file in parallel.
@@ -124,6 +132,7 @@ def _process_single_file_standalone(
     - enable_chunking (bool): If True, chunk the file for processing
     - overwrite (bool): If True, overwrite existing output files
     - representative_file (Optional[Path]): Representative file for resolution calculation
+    - error_log_path (Optional[Path]): If set, pipeline errors in this worker are written here instead of stderr
 
     Returns:
     - dict[str, any]: Dictionary containing the result of the regridding
@@ -154,17 +163,17 @@ def _process_single_file_standalone(
         extract_seafloor=extract_seafloor,
         use_regrid_cache=use_regrid_cache,
         use_seafloor_cache=use_seafloor_cache,
-        verbose=verbose,  # use the passed verbose parameter
+        verbose=verbose,
         max_memory_gb=max_memory_gb,
         chunk_size_gb=chunk_size_gb,
-        enable_parallel=False,  # disable parallel in workers (we are already parallelizing)
+        enable_parallel=False,
         enable_chunking=enable_chunking,
-        memory_monitoring=False,  # disable memory monitoring in workers (we are already monitoring memory)
+        memory_monitoring=False,
     )
-    
-    # set representative file for resolution calculation
     if representative_file:
         pipeline._representative_file = representative_file
+    if error_log_path:
+        pipeline.set_error_log_path(error_log_path)
     
     try:
         # Use lightweight check for has_level to avoid expensive full file analysis
@@ -195,9 +204,53 @@ def _process_single_file_standalone(
                     'grid_types': {}
                 }
             }
-        
-        # regrid file
-        success = pipeline.regrid_file(file_path, output_path, overwrite=overwrite)
+
+        # Exclusive lock on the input file so only one worker processes it (avoids duplicate
+        # work and races on the same output when the same path is submitted from multiple batches).
+        lock_fd = None
+        lock_path = file_path.parent / (file_path.name + ".regrid_lock")
+        if fcntl is not None:
+            try:
+                lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (OSError, BlockingIOError):
+                if lock_fd is not None:
+                    try:
+                        os.close(lock_fd)
+                    except OSError:
+                        pass
+                    lock_fd = None
+                return {
+                    'success': False,
+                    'file_path': file_path,
+                    'skipped': True,
+                    'message': 'File already being processed by another worker',
+                    'stats': {
+                        'files_processed': 0,
+                        'weights_reused': 0,
+                        'weights_generated': 0,
+                        'chunks_processed': 0,
+                        'errors': 0,
+                        'total_size_gb': 0.0,
+                        'memory_peak_gb': 0.0,
+                        'grid_types': {}
+                    }
+                }
+
+        try:
+            # regrid file
+            success = pipeline.regrid_file(file_path, output_path, overwrite=overwrite)
+        finally:
+            if lock_fd is not None:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    os.close(lock_fd)
+                except OSError:
+                    pass
+                try:
+                    lock_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
         
         # collect statistics from the worker's pipeline
         worker_stats = pipeline.stats.copy()
@@ -320,9 +373,10 @@ class CDORegridPipeline:
         # set up console and logger for output
         self.console = Console()
         self.logger = self._setup_logger()
-        
+        self._error_log_path: Optional[Path] = None
+
         # weight cache management
-        self.weight_cache_dir = weight_cache_dir or Path.cwd() / "cdo_weights"  # XXXTODO: make this local to each directory of files being regridded
+        self.weight_cache_dir = weight_cache_dir or Path.cwd() / "cdo_weights"
         self.weight_cache_dir.mkdir(exist_ok=True) if self.weight_cache_dir else None
         self.weight_cache: dict[str, Path] = {}
         self.cleanup_weight_files() if self.weight_cache_dir.exists() and self.cleanup_weights else None    # TODO: check that this works
@@ -367,7 +421,7 @@ class CDORegridPipeline:
         """Prune files with 'regridded' in the name to avoid processing them twice."""
         # ignore any files which have 'cdo_weights' as any parent directory
         input_files = [file for file in input_files if 'cdo_weights' not in file.parents]
-        
+        # TODO: if ever getting levels from a regridded file will need to rethink this
         if self.prune_regridded:
             if overwrite:   # delete existing regridded files
                 for file in input_files:
@@ -448,17 +502,20 @@ class CDORegridPipeline:
         )
     
     def _cleanup_problematic_files(self, input_files: list[Path]) -> list[Path]:
-        """Clean up all problematic files (_top_level and _chunk_) that may cause HDF errors."""
-        return self._cleanup_files_by_pattern(
+        """Clean up all problematic files (_top_level and _chunk_) that may cause HDF errors.
+        Returns the list of input files that remain for processing (non-problematic).
+        """
+        remaining = self._cleanup_files_by_pattern(
             input_files,
             pattern='_top_level',
             file_type='_top_level',
-            exclude_regridded=True # keep regridded top_level files (final form)
-        ) + self._cleanup_files_by_pattern(
-            input_files,
+            exclude_regridded=True  # keep regridded top_level files (final form)
+        )
+        return self._cleanup_files_by_pattern(
+            remaining,
             pattern='_chunk_',
             file_type='_chunk_',
-            exclude_regridded=False # get rid of everything that's still a chunk
+            exclude_regridded=False  # get rid of everything that's still a chunk
         )
     
     def _setup_signal_handlers(self):
@@ -513,19 +570,32 @@ class CDORegridPipeline:
         return Cdo()
     
     def _setup_logger(self) -> logging.Logger:
-        """Set up logging for the pipeline."""
-        logger = logging.getLogger(f"cdo_regrid_{id(self)}")   # TODO: check that this functions for directories
+        """Set up logging for the pipeline. Errors can be redirected to a file via set_error_log_path()."""
+        logger = logging.getLogger(f"cdo_regrid_{id(self)}")
         logger.setLevel(logging.INFO)
-        
         if not logger.handlers:
             handler = logging.StreamHandler()
             formatter = logging.Formatter(
-                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+                "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
             )
             handler.setFormatter(formatter)
             logger.addHandler(handler)
-        
         return logger
+
+    def set_error_log_path(self, path: Path) -> None:
+        """Send pipeline ERROR and WARNING logs to this file instead of the terminal."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(path)
+        file_handler.setLevel(logging.WARNING)
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        )
+        self.logger.addHandler(file_handler)
+        for h in list(self.logger.handlers):
+            if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
+                self.logger.removeHandler(h)
+        self._error_log_path = path
     
     def _detect_grid_type(self, ds: xa.Dataset, dims: dict) -> str:
         """
@@ -875,9 +945,18 @@ ysize = {ysize}"""
             file_info['time_steps'] > 100
         )
     
-    def _chunk_file_by_time(self, file_path: Path, chunk_size: int = 10) -> list[Path]:
-        """Split a file into time chunks, saving the rechunked files to the same directory as the original file.
-        
+    def _chunk_file_by_time(
+        self,
+        file_path: Path,
+        chunk_size: int = 10,
+        name_suffix: Optional[str] = None,
+    ) -> list[Path]:
+        """Split a file into time chunks; chunk files are written to a writable directory.
+
+        When name_suffix is set (e.g. '_top_level', '_seafloor'), chunk stems use it so
+        names stay consistent with extract_surface/extract_seafloor even when preparation
+        returned the original file (no level dim or preparation failed).
+
         Returns (list[Path]): List of paths to the chunked files
         """
         ds = None
@@ -898,12 +977,20 @@ ysize = {ysize}"""
             
             time_chunks = list(range(0, time_length, chunk_size))
             
-            # Check if this is a prepared top_level file and extract base name
-            is_top_level_file = '_top_level' in file_path.stem
-            if is_top_level_file:
-                # Remove _top_level from stem to get base name, then add chunk and _top_level
-                base_stem = file_path.stem.replace('_top_level', '')
+            # Chunk stem: use name_suffix when in surface/seafloor mode so names are e.g.
+            # *_chunk_000_top_level even if prepared_path was the original file.
+            if name_suffix:
+                base_stem = (
+                    file_path.stem.replace("_top_level", "").replace("_seafloor", "").rstrip("_")
+                    or file_path.stem
+                )
+                chunk_stem_template = f"{base_stem}_chunk_{{i:03d}}{name_suffix}"
+            elif "_top_level" in file_path.stem:
+                base_stem = file_path.stem.replace("_top_level", "")
                 chunk_stem_template = f"{base_stem}_chunk_{{i:03d}}_top_level"
+            elif "_seafloor" in file_path.stem:
+                base_stem = file_path.stem.replace("_seafloor", "")
+                chunk_stem_template = f"{base_stem}_chunk_{{i:03d}}_seafloor"
             else:
                 chunk_stem_template = f"{file_path.stem}_chunk_{{i:03d}}"
 
@@ -917,6 +1004,14 @@ ysize = {ysize}"""
                 if v in ds.coords or v in ("lat_bnds", "lon_bnds", "lat", "lon", "time", "time_bnds"):
                     chunk_encoding[v]["_FillValue"] = None
             
+            # Write chunks to a writable directory (input dir may be read-only, e.g. shared data)
+            out_dir = file_path.parent if os.access(file_path.parent, os.W_OK) else Path(tempfile.gettempdir())
+            if out_dir != file_path.parent:
+                # Unique suffix so concurrent runs don't collide when using system temp
+                unique_suffix = f"_{os.getpid()}_{abs(hash(file_path)) % 1000000:06d}"
+            else:
+                unique_suffix = ""
+
             # Create chunks
             for i, start_idx in enumerate(time_chunks):
                 end_idx = min(start_idx + chunk_size, time_length)
@@ -927,7 +1022,7 @@ ysize = {ysize}"""
                     self.logger.warning(f"Skipping empty chunk {i} for {file_path.name}")
                     continue
                 
-                chunk_path = file_path.parent / f"{chunk_stem_template.format(i=i)}{file_path.suffix}"
+                chunk_path = out_dir / f"{chunk_stem_template.format(i=i)}{unique_suffix}{file_path.suffix}"
                 
                 # Write chunk file (same encoding as source so CDO accepts seafloor/top_level chunks)
                 try:
@@ -983,16 +1078,31 @@ ysize = {ysize}"""
                 except Exception:
                     pass
     
-    def _extract_seafloor_values(self, file_path: Path) -> Path:
+    def _extract_seafloor_values(
+        self,
+        file_path: Path,
+        ui: Optional["RegridProgressUI"] = None,
+        ui_input_path: Optional[Path] = None,
+    ) -> Path:
         """
         Extract seafloor values (deepest non-NaN values along depth dimension) from a file.
         Uses cached depth indices for files in the same directory for optimization.
-        
+        For large files, uses chunked reading and reports progress when ui is provided.
+
         Args:
             file_path (Path): Path to the input file
-            
+            ui: Optional progress UI (updates with phases: depth indices, extracting vars, writing)
+            ui_input_path: Path to show in UI (usually same as file_path)
+
         Returns (Path): Path to the seafloor-extracted file
         """
+        _ui_path = ui_input_path if ui_input_path is not None else file_path
+
+        def _progress(pct: int, msg: str) -> None:
+            if ui is not None:
+                ui.update_file_progress(_ui_path, pct, msg, regrid_mode="seafloor")
+            self.logger.info(f"Seafloor extraction: {msg}")
+
         try:
             # Write to a writable dir (temp if input dir is read-only)
             out_dir = file_path.parent if os.access(file_path.parent, os.W_OK) else Path(tempfile.gettempdir())
@@ -1012,7 +1122,8 @@ ysize = {ysize}"""
                     self.console.print(f"[yellow]Re-extracting seafloor (existing file invalid or empty)[/yellow]")
 
             target_variable = self._get_target_variable(file_path)
-            ds = xa.open_dataset(file_path, decode_times=False)
+            # Chunked read for large files: avoids loading the full 3D/4D array at once
+            ds = xa.open_dataset(file_path, decode_times=False, chunks="auto")
             has_level, level_dims, level_count = self._whether_multi_level(dict(ds.sizes))
             
             if not has_level or level_count == 0:
@@ -1040,9 +1151,10 @@ ysize = {ysize}"""
 
             if not cache_hit:
                 # Compute seafloor depth indices: find deepest non-NaN value for each spatial location
+                _progress(11, "Seafloor: computing depth indices (may take several minutes for large files)")
                 if self.verbose:
                     self.console.print(f"[blue]Computing seafloor depth indices for {file_path.name}...[/blue]")
-                
+
                 # Get a representative data variable that has the level dimension
                 # (exclude mesh/coord vars that may have only ncells, vertices)
                 data_vars_with_level = [
@@ -1091,7 +1203,7 @@ ysize = {ysize}"""
                     # For locations with no valid values, use last index
                     deepest_idx = deepest_idx.where(~all_nan_mask, level_size - 1)
                     
-                    # Convert to numpy array for indexing
+                    # Convert to numpy array for indexing (triggers chunked compute if dask)
                     depth_indices_array = deepest_idx.values
                 else:
                     # No spatial dimensions (unlikely but handle it)
@@ -1110,11 +1222,13 @@ ysize = {ysize}"""
                 # Cache the depth indices
                 if use_cache:
                     self._seafloor_depth_cache[dir_key][cache_key] = depth_indices_array
+                _progress(12, "Seafloor: depth indices done" + (" (cached)" if use_cache else ""))
                 if self.verbose:
                     self.console.print(f"[green]Computed seafloor depth indices[/green]" + (" (cached)" if use_cache else ""))
             else:
                 # Use cached depth indices
                 depth_indices_array = self._seafloor_depth_cache[dir_key][cache_key]
+                _progress(12, "Seafloor: using cached depth indices")
                 if self.verbose:
                     self.console.print(f"[cyan]Using cached seafloor depth indices[/cyan]")
                 # spatial_dims needed when depth_indices_array is an array; derive from first data var with level_dim
@@ -1125,63 +1239,39 @@ ysize = {ysize}"""
                     else:
                         spatial_dims = []
 
-            # Extract seafloor values using the depth indices
+            # Extract seafloor values: same structural approach as top_level (isel one level, drop level dim).
+            # Build seafloor dataset from the source dataset so the written file has the same layout CDO
+            # expects (identical to top_level: data at one level, written with plain to_netcdf).
             if self.verbose:
                 self.console.print(f"[blue]Extracting seafloor values from {file_path.name}...[/blue]")
 
-            # Create new dataset with seafloor values
-            seafloor_data_vars = {}
-            for var_name, var_data in ds.data_vars.items():
-                if level_dim in var_data.dims:
-                    # Extract values at seafloor depth indices
-                    if isinstance(depth_indices_array, (int, np.integer)) or np.isscalar(depth_indices_array):
-                        # Single index for all locations
-                        seafloor_data_vars[var_name] = var_data.isel({level_dim: int(depth_indices_array)})
-                    else:
-                        # Different indices for different spatial locations
-                        # Use xarray's advanced indexing with DataArray
-                        # Create a DataArray for the depth indices with matching spatial coordinates
-                        depth_idx_da = xa.DataArray(
-                            depth_indices_array,
-                            dims=spatial_dims,
-                            coords={d: var_data.coords[d] for d in spatial_dims if d in var_data.coords}
-                        )
-                        
-                        # Use isel with the DataArray for advanced indexing
-                        seafloor_data_vars[var_name] = var_data.isel({level_dim: depth_idx_da})
-                else:
-                    # Variable doesn't have level dimension, keep as is
-                    seafloor_data_vars[var_name] = var_data
-            
-            # Build coords without level_dim; omit lat_bnds/lon_bnds so CDO does not report "Inconsistent variable definition"
-            coords_seafloor = {k: v for k, v in ds.coords.items() if k != level_dim and k not in ("lat_bnds", "lon_bnds")}
-            seafloor_ds = xa.Dataset(
-                seafloor_data_vars,
-                coords=coords_seafloor,
-                attrs=ds.attrs
-            )
-            # Remove bounds attribute from lat/lon so the file does not reference missing bounds variables
-            for c in ("lat", "lon"):
-                if c in seafloor_ds.coords:
-                    seafloor_ds[c].attrs.pop("bounds", None)
+            _progress(15, "Seafloor: writing file")
 
-            # Encoding for seafloor write: only set _FillValue=None on coords so CDO accepts the file (CF compliant).
-            # Do not copy source encoding: it can contain backend-specific keys (zstd, blosc, preferred_chunks),
-            # or chunksizes that exceed seafloor dims (level dropped), causing "chunksize cannot exceed dimension size".
-            def _seafloor_encoding() -> dict:
-                enc = {}
-                for v in seafloor_ds.variables:
-                    enc[v] = {}
-                    if v in seafloor_ds.coords or v in ("lat", "lon", "time", "time_bnds"):
-                        enc[v]["_FillValue"] = None
-                return enc
+            # Copy dataset and apply seafloor selection to each variable that has level_dim
+            seafloor_ds = ds.copy(deep=False)
+            if isinstance(depth_indices_array, (int, np.integer)) or np.isscalar(depth_indices_array):
+                seafloor_ds = seafloor_ds.isel({level_dim: int(depth_indices_array)})
+            else:
+                depth_idx_da = xa.DataArray(
+                    depth_indices_array,
+                    dims=spatial_dims,
+                    coords={d: seafloor_ds[target_variable].coords[d] for d in spatial_dims if d in seafloor_ds[target_variable].coords},
+                )
+                for var_name in list(seafloor_ds.data_vars):
+                    if level_dim in seafloor_ds[var_name].dims:
+                        seafloor_ds[var_name] = seafloor_ds[var_name].isel({level_dim: depth_idx_da})
+                seafloor_ds = seafloor_ds.drop_vars(level_dim, errors="ignore")
+            seafloor_ds = seafloor_ds.load()
 
+            # Write next to original file, same way as top_level: plain to_netcdf (no encoding/engine/format)
+            write_dir = seafloor_path.parent if os.access(seafloor_path.parent, os.W_OK) else Path(tempfile.gettempdir())
+            write_path = write_dir / (seafloor_path.name + f".tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}")
             try:
-                seafloor_ds.to_netcdf(seafloor_path, encoding=_seafloor_encoding())
-            except (ValueError, TypeError) as enc_err:
-                # If encoding still causes issues (e.g. netCDF4 backend change), retry with no encoding
-                self.logger.warning(f"Seafloor write with encoding failed ({enc_err}), retrying without encoding")
-                seafloor_ds.to_netcdf(seafloor_path)
+                seafloor_ds.to_netcdf(write_path)
+                write_path.rename(seafloor_path)
+            finally:
+                if write_path.exists():
+                    write_path.unlink(missing_ok=True)
             ds.close()
             seafloor_ds.close()
             
@@ -1200,7 +1290,12 @@ ysize = {ysize}"""
             # Returning original file_path would be misleading
             raise RuntimeError(f"Seafloor extraction failed for {file_path.name}: {e}") from e
     
-    def _prepare_file_for_regridding(self, file_path: Path) -> Path:
+    def _prepare_file_for_regridding(
+        self,
+        file_path: Path,
+        ui: Optional["RegridProgressUI"] = None,
+        ui_input_path: Optional[Path] = None,
+    ) -> Path:
         """
         Prepare a file for regridding according to pipeline mode.
 
@@ -1208,13 +1303,16 @@ ysize = {ysize}"""
         - If extract_surface: extract top level only, return path to top-level file.
         - If neither: return file_path (regrid whole file).
 
+        ui / ui_input_path: optional progress UI; if set, seafloor extraction will update progress (e.g. "Seafloor: computing depth indices").
         Returns (Path): Path to prepared file (possibly a temporary/prepared NetCDF).
         """
         if self.extract_seafloor:
             if "_seafloor" in file_path.stem:
                 return file_path
             try:
-                prepared_path = self._extract_seafloor_values(file_path)
+                prepared_path = self._extract_seafloor_values(
+                    file_path, ui=ui, ui_input_path=ui_input_path
+                )
                 return prepared_path
             except Exception as e:
                 self.logger.error(f"Seafloor extraction failed, cannot proceed with regridding: {e}")
@@ -1237,9 +1335,12 @@ ysize = {ysize}"""
                 if dim in ds.dims:
                     ds = ds.isel({dim: 0})
                     break
-            # Write to a writable dir (temp if input dir is read-only)
+            # Write to a writable dir (temp if input dir is read-only). Use a unique
+            # path per process so concurrent workers never write the same file (avoids
+            # PermissionError and races when the same source is processed in parallel).
             prep_dir = file_path.parent if os.access(file_path.parent, os.W_OK) else Path(tempfile.gettempdir())
-            prepared_path = prep_dir / f"{file_path.stem}_top_level{file_path.suffix}"
+            unique_suffix = f"_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+            prepared_path = prep_dir / f"{file_path.stem}_top_level{unique_suffix}{file_path.suffix}"
             ds.to_netcdf(prepared_path)
             self._track_created_file(prepared_path)
             if self.verbose_diagnostics:
@@ -1249,6 +1350,35 @@ ysize = {ysize}"""
         except Exception as e:
             self.logger.warning(f"Could not prepare file {file_path}: {e}")
             self.logger.error(f"Full traceback: {traceback.format_exc()}")
+            return file_path
+
+    def _ensure_top_level_file_for_chunking(self, file_path: Path) -> Path:
+        """When chunking in extract_surface mode, ensure we chunk a top-level-only file.
+
+        If preparation was skipped (prepared_path == input_path) but the file has multiple
+        levels, chunk files would be named *_top_level but contain all levels. This helper
+        extracts top level to a temp file when needed so chunk content matches the name.
+        """
+        try:
+            with xa.open_dataset(file_path, decode_times=False) as ds:
+                has_level, level_dims, level_count = self._whether_multi_level(dict(ds.sizes))
+                if not has_level or level_count <= 1:
+                    return file_path
+                for dim in level_dims:
+                    if dim in ds.dims:
+                        ds = ds.isel({dim: 0})
+                        break
+                prep_dir = file_path.parent if os.access(file_path.parent, os.W_OK) else Path(tempfile.gettempdir())
+                unique_suffix = f"_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+                top_path = prep_dir / f"{file_path.stem}_top_level{unique_suffix}{file_path.suffix}"
+                ds.to_netcdf(top_path)
+                self._track_created_file(top_path)
+                self.logger.info(
+                    f"Created top-level temp file for chunking (was multi-level): {top_path.name}"
+                )
+                return top_path
+        except Exception as e:
+            self.logger.warning(f"Could not create top-level file for chunking: {e}")
             return file_path
 
     def _is_valid_prepared_file(self, prepared_path: Path) -> bool:
@@ -1619,7 +1749,16 @@ ysize = {ysize}"""
             self.console.print(Panel(f"[bold cyan]{step_msg}[/bold cyan]", style="dim"))
         if ui:
             ui.update_file_progress(input_path, 10, step_msg, regrid_mode=regrid_mode)
-        prepared_path = self._prepare_file_for_regridding(input_path)
+        prepared_path = self._prepare_file_for_regridding(input_path, ui=ui, ui_input_path=input_path)
+        if self.extract_surface and prepared_path == input_path:
+            self.logger.warning(
+                f"Surface extraction skipped for {input_path.name} (no level dim or preparation failed); "
+                "regridding whole file. Chunk names will still use _top_level for consistency."
+            )
+        if self.extract_seafloor and prepared_path == input_path and "_seafloor" not in input_path.stem:
+            self.logger.warning(
+                f"Seafloor extraction skipped for {input_path.name}; regridding whole file."
+            )
 
         if not self._is_valid_prepared_file(prepared_path):
             self.logger.error(
@@ -1654,7 +1793,13 @@ ysize = {ysize}"""
             if should_chunk:
                 if ui:
                     ui.update_file_progress(input_path, 30, "Creating chunks", regrid_mode=regrid_mode)
-                chunk_files = self._chunk_file_by_time(prepared_path)
+                # When extract_surface but preparation was skipped, prepared_path may be the
+                # full multi-level file; chunking it would produce *_chunk_*_top_level.nc with
+                # all levels. Ensure we chunk a top-level-only file.
+                if self.extract_surface and prepared_path == input_path:
+                    prepared_path = self._ensure_top_level_file_for_chunking(input_path)
+                name_suffix = "_top_level" if self.extract_surface else ("_seafloor" if self.extract_seafloor else None)
+                chunk_files = self._chunk_file_by_time(prepared_path, name_suffix=name_suffix)
                 if ui:
                     ui.update_file_progress(input_path, 50, "Regridding chunks", regrid_mode=regrid_mode)
                 success = self._regrid_chunked_file(
@@ -1742,6 +1887,23 @@ ysize = {ysize}"""
             
         # clean up problematic files (_top_level and _chunk_) first
         input_files = self._cleanup_problematic_files(input_files)
+
+        # Deduplicate by resolved path so the same original file is never processed by more than one worker
+        seen: set[Path] = set()
+        deduped: list[Path] = []
+        for f in input_files:
+            try:
+                r = f.resolve()
+            except OSError:
+                r = f
+            if r not in seen:
+                seen.add(r)
+                deduped.append(f)
+        if len(deduped) < len(input_files) and self.verbose:
+            self.console.print(
+                f"[blue]Deduplicated input: {len(input_files)} -> {len(deduped)} files (same path only processed once)[/blue]"
+            )
+        input_files = deduped
         
         if overwrite:
             # unlink any files with 'regridded' in the name in order to reprocess them
@@ -1785,6 +1947,18 @@ ysize = {ysize}"""
                 if 'regridded' not in file.name and not file.suffix.endswith('.part')
             ]
         
+        # Always redirect pipeline errors (seafloor, regrid, etc.) to a log file so they are
+        # captured even when running quiet or without UI
+        if input_files:
+            from esgpull.esgpullplus import config
+            log_dir = config.log_dir
+            log_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            self._error_log_path = log_dir / f"regrid_errors_{timestamp}.log"
+            self.set_error_log_path(self._error_log_path)
+            if use_ui and self.verbose:
+                self.console.print(f"[dim]Errors logged to: {self._error_log_path}[/dim]")
+
         self.start_time = fileops.print_timestamp(self.console, "START")
         
         if not self.enable_parallel or len(input_files) < 2 or self.max_workers in [None, 1]:
@@ -1833,6 +2007,7 @@ ysize = {ysize}"""
                             overwrite,
                             representative_file,
                             self.verbose,
+                            self._error_log_path,
                         )
                         futures.append(future)
                 
@@ -1949,7 +2124,10 @@ ysize = {ysize}"""
         ui = None
         if use_ui and self.verbose:
             ui = RegridProgressUI(
-                input_files, verbose=self.verbose, verbose_diagnostics=self.verbose_diagnostics
+                input_files,
+                verbose=self.verbose,
+                verbose_diagnostics=self.verbose_diagnostics,
+                log_file=self._error_log_path,
             )
             ui.__enter__()
         # group files by directory if requested
@@ -2219,6 +2397,12 @@ def regrid_single_file(
             input_path, has_level, extract_surface, extract_seafloor
         )
         output_path = output_dir / filename
+    # Ensure pipeline errors (seafloor, regrid, etc.) go to a log file
+    from esgpull.esgpullplus import config
+    config.log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    error_log_path = config.log_dir / f"regrid_errors_{timestamp}.log"
+    pipeline.set_error_log_path(error_log_path)
     # Initialize UI if requested
     ui = None
     if use_ui and verbose:
@@ -2226,6 +2410,7 @@ def regrid_single_file(
             [input_path],
             verbose=verbose,
             verbose_diagnostics=pipeline.verbose_diagnostics,
+            log_file=error_log_path,
         )
         ui.__enter__()
     # Track processing time
