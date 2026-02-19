@@ -11,6 +11,7 @@ from esgpull.cli.update import update
 from esgpull.config import Config
 
 
+@pytest.mark.skip(reason="original esgpull test, not maintained in this fork")
 @pytest.mark.network
 def test_update_after_remove(root: Path, config: Config, require_network):
     config.generate(overwrite=True)

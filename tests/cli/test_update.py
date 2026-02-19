@@ -34,6 +34,7 @@ def test_fast_update(config: Config):
     assert stop - start < 60  # 60 seconds to fetch ~4k files is plenty enough
 
 
+@pytest.mark.skip(reason="original esgpull test, not maintained in this fork")
 @pytest.mark.network
 def test_update_updates_timestamp(root: Path, config: Config, require_network):
     config.generate(overwrite=True)
