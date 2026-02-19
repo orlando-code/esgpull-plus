@@ -222,16 +222,6 @@ class AsyncRegridProcessor:
         except asyncio.QueueFull:
             log.warning(f"Queue full, dropping: {file_path.name}")
 
-    # ------------------------------------------------------------------
-    # Output path helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _output_dir_for(file_path: Path) -> Path:
-        """Regridded files go into a ``regridded/`` sibling directory."""
-        out = file_path.parent / "regridded"
-        out.mkdir(exist_ok=True)
-        return out
 
     # ------------------------------------------------------------------
     # Batch processing
@@ -241,6 +231,19 @@ class AsyncRegridProcessor:
         """Process a batch of files using the CDO regrid pipeline."""
         if not files:
             return
+
+        # Deduplicate so the same path is only processed once per batch
+        seen: set[Path] = set()
+        deduped: list[Path] = []
+        for fp in files:
+            try:
+                r = fp.resolve()
+            except OSError:
+                r = fp
+            if r not in seen:
+                seen.add(r)
+                deduped.append(fp)
+        files = deduped
 
         from concurrent.futures import ProcessPoolExecutor
         from esgpull.esgpullplus.cdo_regrid import _process_single_file_standalone
@@ -252,12 +255,10 @@ class AsyncRegridProcessor:
 
         with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
             for fp in files:
-                output_dir = self._output_dir_for(fp)
                 future = loop.run_in_executor(
                     executor,
                     _process_single_file_standalone,
                     fp,
-                    output_dir,
                     self.target_resolution,
                     self.target_grid,
                     self.weight_cache_dir,
@@ -385,11 +386,6 @@ class AsyncRegridProcessor:
             if "regridded" in nc.name:
                 continue
 
-            # Check if already regridded
-            out_basename = nc.stem + "_regridded" + nc.suffix
-            out_file = nc.parent / "regridded" / out_basename
-            if out_file.exists() and not self.overwrite:
-                continue
 
             if self.validate_can_open and not _is_nc_fully_formed(nc, validate_open=True):
                 log.debug("Skip existing (not openable): %s", nc.name)
@@ -561,9 +557,10 @@ parser.add_argument("--overwrite", action="store_true", dest="overwrite", defaul
 parser.add_argument("--delete-original", action="store_true", dest="delete_original", default=False)
 parser.add_argument("--process-existing", action="store_true", dest="process_existing", default=True)
 
-args = parser.parse_args()
 
 def main():
+    """CLI entry point; parse args only when run as __main__ so importing the module (e.g. in tests) does not consume sys.argv."""
+    args = parser.parse_args()
     start_async_regridder(
         watch_dir=args.watch_dir,
         target_resolution=args.target_resolution,
@@ -582,6 +579,7 @@ def main():
         delete_original=args.delete_original,
         process_existing=args.process_existing,
     )
+
 
 if __name__ == "__main__":
     main()
