@@ -22,11 +22,11 @@ class QueryFiles:
     skip: bool = False
     datasets: list[Dataset] = field(default_factory=list)
     files: list[File] = field(default_factory=list)
-    dataset_hits: int = field(init=False)
-    hits: int = field(init=False)
-    hints: HintsDict = field(init=False)
-    results: list[ResultSearch] = field(init=False)
-    dataset_results: list[ResultSearch] = field(init=False)
+    dataset_hits: int = field(init=False, default=0)
+    hits: int = field(init=False, default=0)
+    hints: HintsDict = field(init=False, default_factory=dict)
+    results: list[ResultSearch] = field(init=False, default_factory=list)
+    dataset_results: list[ResultSearch] = field(init=False, default_factory=list)
 
 
 @click.command()
