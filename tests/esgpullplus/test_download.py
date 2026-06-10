@@ -17,10 +17,17 @@ class DummyFS:
 class DummyFile:
     """Minimal EnhancedFile-like stub for DownloadSubset tests."""
 
-    def __init__(self, file_id: str, local_root: Path):
+    def __init__(
+        self,
+        file_id: str,
+        local_root: Path,
+        *,
+        filename: str | None = None,
+        local_path: str | Path = "subdir",
+    ):
         self.file_id = file_id
-        self.filename = f"{file_id}.nc"
-        self.local_path = Path("subdir")
+        self.filename = filename or f"{file_id}.nc"
+        self.local_path = Path(local_path) if not isinstance(local_path, Path) else local_path
         self.size = 10
         self.url = "http://example.com/file.nc"
         self._root = local_root
@@ -44,6 +51,48 @@ def test_get_file_path_uses_data_dir_when_no_output_dir(tmp_path):
 
     path = subset._get_file_path(file)
     assert path == tmp_path / "custom" / file.local_path / file.filename
+
+
+def test_find_existing_path_ignores_version_mismatch(tmp_path):
+    fs = DummyFS(tmp_path / "data")
+    local = Path(
+        "CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3/historical/r3i1p1f1/Omon/tos/gn/v20200514"
+    )
+    filename = "tos_Omon_EC-Earth3_historical_r3i1p1f1_gn_195601-195612.nc"
+    on_disk = (
+        tmp_path
+        / "CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3/historical/r3i1p1f1/Omon/tos/gn/v20200730"
+    )
+    on_disk.mkdir(parents=True)
+    (on_disk / filename).write_bytes(b"x" * 128)
+
+    file = DummyFile("f1", tmp_path, filename=filename, local_path=local)
+    subset = dl_mod.DownloadSubset(files=[file], fs=fs, data_dir=tmp_path)
+
+    found = subset._find_existing_path(file)
+    assert found == on_disk / filename
+    assert subset._file_exists(file) is True
+
+
+def test_variant_coverage_accepts_ec_earth3_hr(tmp_path):
+    fs = DummyFS(tmp_path / "data")
+    local = Path(
+        "CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3/historical/r3i1p1f1/Omon/tos/gn/v20200514"
+    )
+    requested = "tos_Omon_EC-Earth3_historical_r3i1p1f1_gn_195601-195612.nc"
+    hr_path = (
+        tmp_path
+        / "CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-HR/historical/r1i1p1f1/Omon/tos/gn/v20250225"
+    )
+    hr_path.mkdir(parents=True)
+    hr_file = hr_path / "tos_Omon_EC-Earth3-HR_historical_r1i1p1f1_gn_195601-195612.nc"
+    hr_file.write_bytes(b"x" * 128)
+
+    file = DummyFile("f1", tmp_path, filename=requested, local_path=local)
+    subset = dl_mod.DownloadSubset(files=[file], fs=fs, data_dir=tmp_path)
+
+    assert subset._variant_coverage_exists(file) == hr_file
+    assert subset._file_exists(file) is True
 
 
 def test_try_alternative_file_invokes_api_and_download(monkeypatch, tmp_path):
@@ -122,4 +171,3 @@ def test_try_alternative_file_invokes_api_and_download(monkeypatch, tmp_path):
     failed_dict, excluded_ids = api_instance.called_with
     assert failed_dict["file_id"] == file.file_id
     assert excluded_ids == [file.file_id]
-

@@ -9,6 +9,8 @@ from rich.progress import (
 )
 import logging
 from datetime import datetime
+from pathlib import Path
+from typing import Optional
 
 # custom
 from esgpull.esgpullplus import config
@@ -16,6 +18,38 @@ from esgpull.esgpullplus import config
 # TODO: remove FAILED files from UI after 10s (like with successful files)
 # TODO: fix incorrectly marked failed files
 # TODO: fix files mislabelled as cancelled in final summary
+
+_DOWNLOAD_ERROR_LOGGER_NAME = "esgpull.download_errors"
+_download_error_log_path: Optional[Path] = None
+
+
+def init_download_error_log() -> Path:
+    """Create one error log file per API run; reused across download batches."""
+    global _download_error_log_path
+    if _download_error_log_path is not None:
+        return _download_error_log_path
+
+    log_dir = config.log_dir
+    log_dir.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    _download_error_log_path = log_dir / f"download_errors_{timestamp}.log"
+
+    logger = logging.getLogger(_DOWNLOAD_ERROR_LOGGER_NAME)
+    logger.setLevel(logging.ERROR)
+    logger.propagate = False
+    if not logger.handlers:
+        handler = logging.FileHandler(_download_error_log_path)
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        )
+        logger.addHandler(handler)
+
+    return _download_error_log_path
+
+
+def get_download_error_log_path() -> Optional[Path]:
+    return _download_error_log_path
+
 
 class DownloadProgressUI:
     """Manages rich progress bars for overall and per-file download, with status in the bar description."""
@@ -48,24 +82,8 @@ class DownloadProgressUI:
         self._setup_logger()
 
     def _setup_logger(self):
-        self.logger = logging.getLogger(f"download_errors_{id(self)}")  # TODO: this isn't working (nothing written)
-        self.logger.setLevel(logging.ERROR)
-
-        # Create logs directory next to the current file
-        log_dir = config.log_dir
-        log_dir.mkdir(exist_ok=True)
-
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        log_file = log_dir / f"download_errors_{timestamp}.log"
-
-        handler = logging.FileHandler(log_file)
-        formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-        handler.setFormatter(formatter)
-
-        # Clear existing handlers and add the new one
-        if self.logger.hasHandlers():
-            self.logger.handlers.clear()
-        self.logger.addHandler(handler)
+        init_download_error_log()
+        self.logger = logging.getLogger(_DOWNLOAD_ERROR_LOGGER_NAME)
 
     def __enter__(self):
         self.progress.__enter__()
@@ -88,10 +106,12 @@ class DownloadProgressUI:
 
     def set_status(self, file, status, color=None):
         """Update the status for a file and update the progress bar description."""
+        task_id = self.file_task_ids.get(file.file_id)
+        if task_id is None:
+            return
         fname = file.filename
         color = color or "white"
         desc = f"[{color}][{status}] {fname}"
-        task_id = self.file_task_ids[file.file_id]
         self.progress.update(task_id, description=desc)
         self.file_status[fname] = status
         if status == "DONE":
@@ -104,19 +124,32 @@ class DownloadProgressUI:
         #     print(status)
         #     self.status_counts["unknown"] += 1
 
-    def add_failed(self, file, msg, exc_info=None):
+    def add_failed(self, file, msg, exc_info=False):
         self.failed_files.append((file, msg))
-        self.logger.error(f"File: {file.filename} - {msg}", exc_info=exc_info)
+        init_download_error_log()
+        self.logger.error(
+            "%s | node=%s | %s",
+            file.filename,
+            getattr(file, "data_node", "Unknown"),
+            msg,
+            exc_info=exc_info,
+        )
+        for handler in self.logger.handlers:
+            handler.flush()
 
     def complete_file(self, file):
         # Advance overall progress and mark file bar as complete
-        task_id = self.file_task_ids[file.file_id]
+        task_id = self.file_task_ids.get(file.file_id)
+        if task_id is None:
+            return
         self.progress.update(task_id, completed=self.progress.tasks[task_id].total)
         if self.overall_task is not None:
             self.progress.advance(self.overall_task)
 
     def update_file_progress(self, file, completed, total=None):
-        task_id = self.file_task_ids[file.file_id]
+        task_id = self.file_task_ids.get(file.file_id)
+        if task_id is None:
+            return
         if total is not None:
             self.progress.update(task_id, completed=completed, total=total)
         else:
@@ -151,20 +184,18 @@ class DownloadProgressUI:
             Panel(table, title="[white]Download Summary", border_style="white")
         )
         if self.failed_files:
-            console.print(f"\n[red]Failed Files ({len(self.failed_files)}):[/red]")
-            for i, (file, msg) in enumerate(self.failed_files):
-                console.print(f"[red]{i+1}. {file.filename}[/red]")
-                console.print(f"   [red]Error: {msg}[/red]")
-                console.print(f"   [red]URL: {file.url}[/red]")
-                console.print(f"   [red]Data Node: {getattr(file, 'data_node', 'Unknown')}[/red]")
-                console.print("")
-            
-            # Show first failure in detail
-            file, msg = self.failed_files[0]
-            console.print(
-                Panel(
-                    f"First failed file: [bold]{file.filename}[/bold]\n[red]{msg}[/red]\n\nURL: {file.url}\nData Node: {getattr(file, 'data_node', 'Unknown')}",
-                    title="[red]Detailed Failure Info[/red]",
-                    style="red",
+            log_path = get_download_error_log_path()
+            if log_path:
+                console.print(
+                    f"\n[red]{len(self.failed_files)} failed — see {log_path}[/red]"
                 )
-            )
+            else:
+                console.print(f"\n[red]{len(self.failed_files)} failed[/red]")
+            preview = self.failed_files[:5]
+            for file, msg in preview:
+                short_msg = msg if len(msg) <= 120 else msg[:117] + "..."
+                console.print(f"  [red]• {file.filename}[/red] [dim]({short_msg})[/dim]")
+            if len(self.failed_files) > len(preview):
+                console.print(
+                    f"  [dim]… and {len(self.failed_files) - len(preview)} more in log[/dim]"
+                )
