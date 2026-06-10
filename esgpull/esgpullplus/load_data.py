@@ -338,17 +338,17 @@ class SourceDataset:
 class CMIP6DataLoader:
     """Main class for loading CMIP6 data into xarray datasets."""
     
-    def __init__(self, data_root: Union[str, Path], prefer_regridded: bool = True, prefer_top_level: bool = True):
+    def __init__(self, data_root: Union[str, Path], regridded_only: bool = True, prefer_top_level: bool = True):
         """
         Initialize the data loader.
         
         Args:
             data_root: Root directory containing CMIP6 data
-            prefer_regridded: If True, prefer regridded files when both exist
+            regridded_only: If True, prefer regridded files when both exist
             prefer_top_level: If True, prefer top_level files when both exist
         """
         self.data_root = Path(data_root)
-        self.prefer_regridded = prefer_regridded
+        self.regridded_only = regridded_only
         self.prefer_top_level = prefer_top_level
         self.catalog = DataCatalog(data_root=self.data_root)
         
@@ -415,7 +415,7 @@ class CMIP6DataLoader:
             institute=institute,
             mip=mip,
             frequency=frequency,
-            is_regridded=self.prefer_regridded,
+            is_regridded=self.regridded_only,
             is_top_level=self.prefer_top_level if self.prefer_top_level is not None else None,
             year_min=year_start,
             year_max=year_end,
@@ -601,7 +601,7 @@ class CMIP6DataLoader:
         # Get all unique sources for historical experiment
         historical_files = self.catalog.get_files(
             experiment='historical',
-            is_regridded=self.prefer_regridded,
+            is_regridded=self.regridded_only,
         )
         
         # Get unique sources (institute/model/variant combinations)
