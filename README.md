@@ -107,6 +107,7 @@ search_criteria:
     limit: 10       # max results per sub-search
 
 meta_criteria:
+  test: false
   data_dir: /path/to/data
   max_workers: 4
 ```
@@ -129,8 +130,14 @@ python -m esgpull.esgpullplus.api --symmetrical  # only download sources with bo
 | `search_criteria.*` | ESGF facets (project, table_id, experiment_id, variable/variable_id, frequency, etc.). |
 | `search_criteria.filter.top_n` | Number of top grouped datasets to keep. |
 | `search_criteria.filter.limit` | Maximum number of results per sub-search (useful for debugging). |
-| `meta_criteria.data_dir` | Base directory for downloaded data and cached search results. |
+| `meta_criteria.test` | If `true` (default), downloads go flat to `test_downloads/` in the repo. Set `false` to use `data_dir` with CMIP6 directory layout. |
+| `meta_criteria.data_dir` | Base directory for downloaded data and cached search results (used when `test: false`). |
+| `meta_criteria.output_dir` | Optional flat output directory when `test: false` (overrides `data_dir` layout). |
 | `meta_criteria.max_workers` | Worker count used for any post-download regridding. |
+| `meta_criteria.regrid_variables` | Optional list of CMIP variable prefixes to regrid after download (e.g. `tos`). |
+| `meta_criteria.find_alternatives` | If `true` (default), retry failed downloads from other ESGF data nodes. |
+
+Download errors are appended to a single session log under `logs/download_errors_<timestamp>.log` (path printed at startup and in batch summaries when failures occur).
 
 ### Search analysis script
 
@@ -160,8 +167,8 @@ Single pipeline in `esgpull.esgpullplus.cdo_regrid`: regridding with regrid weig
 ### Command line
 
 ```bash
-# Directory: surface only
-python -m esgpull.esgpullplus.cdo_regrid /path/to/dir -o /path/to/out -r 1.0 1.0 --extract-surface
+# Directory: surface only, tos variable only
+python -m esgpull.esgpullplus.cdo_regrid /path/to/dir -o /path/to/out -r 1.0 1.0 --extract-surface --variable tos
 
 # Directory: seafloor only
 python -m esgpull.esgpullplus.cdo_regrid /path/to/dir -o /path/to/out --extract-seafloor --max-workers 2
@@ -181,6 +188,7 @@ python -m esgpull.esgpullplus.cdo_regrid /path/to/file.nc -o /path/to/out.nc --e
 | `-o`, `--output` | same as input dir | Output file or directory; if omitted, writes next to input. |
 | `-r`, `--resolution lon lat` | `1.0 1.0` | Target output resolution (lon_res, lat_res). |
 | `-p`, `--pattern` | `"*.nc"` | File pattern when `input` is a directory. |
+| `--variable`, `-V` | all | CMIP variable prefix(es) to regrid (e.g. `tos` or `tos uo`). |
 | `--include-subdirectories` | `True` | Include subdirectories when walking a directory. |
 | `--extract-surface` | `False` | Extract and regrid only the top level (surface). |
 | `--extract-seafloor` | `False` | Extract and regrid only seafloor values. |
