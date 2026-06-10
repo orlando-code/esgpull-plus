@@ -14,6 +14,7 @@ import hashlib
 import os
 import tempfile
 import uuid
+from contextlib import contextmanager
 
 try:
     import fcntl
@@ -39,8 +40,50 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from esgpull.esgpullplus import utils, fileops
+from esgpull.esgpullplus import utils, fileops, config
 from esgpull.esgpullplus.regrid_ui import RegridProgressUI, BatchRegridUI
+
+_REGRID_ERROR_LOGGER_NAME = "esgpull.regrid_errors"
+_regrid_error_log_path: Optional[Path] = None
+
+
+def init_regrid_error_log(path: Optional[Path] = None) -> Path:
+    """One regrid error log per run; safe for parallel workers to append."""
+    global _regrid_error_log_path
+    if path is not None:
+        _regrid_error_log_path = Path(path)
+    elif _regrid_error_log_path is None:
+        log_dir = config.log_dir
+        log_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        _regrid_error_log_path = log_dir / f"regrid_errors_{timestamp}.log"
+
+    logger = logging.getLogger(_REGRID_ERROR_LOGGER_NAME)
+    logger.setLevel(logging.WARNING)
+    logger.propagate = False
+    if not any(
+        isinstance(h, logging.FileHandler)
+        and getattr(h, "baseFilename", None) == str(_regrid_error_log_path.resolve())
+        for h in logger.handlers
+    ):
+        handler = logging.FileHandler(_regrid_error_log_path)
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        )
+        logger.addHandler(handler)
+    return _regrid_error_log_path
+
+
+def log_regrid_error(message: str, exc: Optional[BaseException] = None) -> None:
+    """Append a regrid error to the shared session log."""
+    init_regrid_error_log()
+    logger = logging.getLogger(_REGRID_ERROR_LOGGER_NAME)
+    if exc is not None:
+        logger.error("%s\n%s", message, traceback.format_exc())
+    else:
+        logger.error(message)
+    for handler in logger.handlers:
+        handler.flush()
 
 # Encoding keys accepted by xarray's netCDF4 backend (source files may use zstd/blosc/preferred_chunks etc.)
 _NC4_ENCODING_KEYS = frozenset({
@@ -64,6 +107,28 @@ _NC4_ENCODING_KEYS = frozenset({
 # FileNotFoundError: [Errno 2] No such file or directory: '/tmp/tmp_l7gazi6/chunk_001.nc'
 
 # 2025-11-03 16:00:02,286 - cdo_regrid_132985047169488 - ERROR - Chunk file so_Omon_AWI-CM-1-1-MR_historical_r3i1p1f1_gn_198101-199012_chunk_001.nc is empty or was not created
+
+
+@contextmanager
+def _weight_file_lock(weight_path: Path):
+    """Serialize weight generation and validation across parallel workers."""
+    if fcntl is None:
+        yield
+        return
+    lock_path = weight_path.parent / f"{weight_path.name}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def weight_cache_dir_for_input(input_path: Path) -> Path:
+    """Per-leaf-directory CDO weight cache (avoids cross-model collisions)."""
+    return input_path.parent / "cdo_weights"
 
 
 def _process_chunk_standalone(args):
@@ -92,6 +157,10 @@ def _process_chunk_standalone(args):
         )
         return (chunk_idx, chunk_output, True, None)
     except Exception as e:
+        log_regrid_error(
+            f"Chunk {chunk_idx} remap failed ({chunk_file}): {e}",
+            exc=e,
+        )
         return (chunk_idx, chunk_output, False, str(e))
 
 
@@ -166,14 +235,15 @@ def _process_single_file_standalone(
         verbose=verbose,
         max_memory_gb=max_memory_gb,
         chunk_size_gb=chunk_size_gb,
+        max_workers=1,
         enable_parallel=False,
         enable_chunking=enable_chunking,
         memory_monitoring=False,
     )
+    error_log = init_regrid_error_log(error_log_path)
     if representative_file:
         pipeline._representative_file = representative_file
-    if error_log_path:
-        pipeline.set_error_log_path(error_log_path)
+    pipeline._error_log_path = error_log
     
     try:
         # Use lightweight check for has_level to avoid expensive full file analysis
@@ -376,10 +446,12 @@ class CDORegridPipeline:
         self._error_log_path: Optional[Path] = None
 
         # weight cache management
-        self.weight_cache_dir = weight_cache_dir or Path.cwd() / "cdo_weights"
-        self.weight_cache_dir.mkdir(exist_ok=True) if self.weight_cache_dir else None
+        self.weight_cache_dir = Path(weight_cache_dir) if weight_cache_dir else None
+        if self.weight_cache_dir:
+            self.weight_cache_dir.mkdir(parents=True, exist_ok=True)
         self.weight_cache: dict[str, Path] = {}
-        self.cleanup_weight_files() if self.weight_cache_dir.exists() and self.cleanup_weights else None    # TODO: check that this works
+        if self.weight_cache_dir and self.cleanup_weights:
+            self.cleanup_weight_files()
         
         # monitor memory to prevent antisocial behaviour on shared machines andout of memory errors
         self.memory_monitor = MemoryMonitor() if memory_monitoring else None
@@ -570,32 +642,15 @@ class CDORegridPipeline:
         return Cdo()
     
     def _setup_logger(self) -> logging.Logger:
-        """Set up logging for the pipeline. Errors can be redirected to a file via set_error_log_path()."""
-        logger = logging.getLogger(f"cdo_regrid_{id(self)}")
-        logger.setLevel(logging.INFO)
-        if not logger.handlers:
-            handler = logging.StreamHandler()
-            formatter = logging.Formatter(
-                "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-            )
-            handler.setFormatter(formatter)
-            logger.addHandler(handler)
-        return logger
+        """Pipeline logger; errors go to the shared session log via log_regrid_error."""
+        return logging.getLogger(_REGRID_ERROR_LOGGER_NAME)
 
     def set_error_log_path(self, path: Path) -> None:
-        """Send pipeline ERROR and WARNING logs to this file instead of the terminal."""
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.FileHandler(path)
-        file_handler.setLevel(logging.WARNING)
-        file_handler.setFormatter(
-            logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-        )
-        self.logger.addHandler(file_handler)
-        for h in list(self.logger.handlers):
-            if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
-                self.logger.removeHandler(h)
-        self._error_log_path = path
+        """Ensure the shared regrid error log is initialized for this run."""
+        self._error_log_path = init_regrid_error_log(path)
+
+    def _log_error(self, message: str, exc: Optional[BaseException] = None) -> None:
+        log_regrid_error(message, exc=exc)
     
     def _detect_grid_type(self, ds: xa.Dataset, dims: dict) -> str:
         """
@@ -658,7 +713,30 @@ class CDORegridPipeline:
             return 'structured'
         
         raise ValueError(f"Could not determine grid type for file TODO")     # TODO: get access to file_path to raise error
-    
+
+    def _has_grid_corners(self, ds: xa.Dataset) -> bool:
+        """Return True when CDO can use conservative remapping (cell corners present)."""
+        names = set(ds.coords) | set(ds.data_vars)
+        lat_bounds = {"bounds_lat", "lat_bnds", "vertices_latitude"} & names
+        lon_bounds = {"bounds_lon", "lon_bnds", "vertices_longitude"} & names
+        if lat_bounds and lon_bounds:
+            return True
+
+        for lat_name, lon_name in (("lat", "lon"), ("latitude", "longitude")):
+            if lat_name not in ds.coords or lon_name not in ds.coords:
+                continue
+            lat_bnds = ds[lat_name].attrs.get("bounds")
+            lon_bnds = ds[lon_name].attrs.get("bounds")
+            if lat_bnds in names and lon_bnds in names:
+                return True
+        return False
+
+    def _regrid_operators(self, grid_type: str, has_grid_corners: bool) -> tuple[str, str]:
+        """Return CDO (remap, gen_weights) operators for this source grid."""
+        if grid_type == "structured" or has_grid_corners:
+            return "remapcon", "gencon"
+        return "remapbil", "genbil"
+
     def _whether_multi_level(self, dims: dict) -> tuple[bool, list[str], int]:
         """Whether the file has a multi-level dimension.
         
@@ -740,6 +818,10 @@ class CDORegridPipeline:
             except Exception as grid_error:
                 self.logger.warning(f"Could not detect grid type for {file_path}: {grid_error}")
                 grid_type = 'unknown'
+
+            has_grid_corners = (
+                grid_type == "structured" or self._has_grid_corners(ds)
+            )
             
             # estimate memory usage required for regridding
             estimated_memory_gb = file_size_gb * 3  # rough but conservative estimate: when regridding will have original, multiple, and maybe an intermediate array in memory
@@ -751,6 +833,7 @@ class CDORegridPipeline:
                 'level_count': level_count,
                 'coords': coords_info,
                 'grid_type': grid_type,
+                'has_grid_corners': has_grid_corners,
                 'estimated_memory_gb': estimated_memory_gb,
                 'time_steps': dims.get('time', 1),
             }
@@ -768,6 +851,7 @@ class CDORegridPipeline:
                 'level_count': 0,
                 'coords': {},
                 'grid_type': 'unknown',
+                'has_grid_corners': False,
                 'estimated_memory_gb': 0.0,
                 'time_steps': None,
             }
@@ -777,10 +861,16 @@ class CDORegridPipeline:
     
     def _get_grid_signature(self, file_info: dict) -> str:
         """Generate a unique signature for the grid based on file info to avoid duplicating weights."""
+        remap_op, gen_op = self._regrid_operators(
+            file_info['grid_type'],
+            file_info.get('has_grid_corners', False),
+        )
         signature_data = {
             'coords': file_info['coords'],
             'dims': file_info['dims'],
             'grid_type': file_info['grid_type'],
+            'remap_op': remap_op,
+            'gen_op': gen_op,
         }
         
         signature_str = str(sorted(signature_data.items()))
@@ -788,7 +878,35 @@ class CDORegridPipeline:
     
     def _get_weight_path(self, grid_signature: str) -> Path:
         """Get the path for regrid weights based on grid signature."""
-        return self.weight_cache_dir / f"weights_{grid_signature}.nc"   # TODO: make sure this works for directories
+        if self.weight_cache_dir is None:
+            raise RuntimeError("weight_cache_dir is not set")
+        return self.weight_cache_dir / f"weights_{grid_signature}.nc"
+
+    def _cleanup_stale_chunks_for_file(self, file_path: Path) -> None:
+        """Remove leftover chunk files from prior failed runs of the same source file."""
+        stem = file_path.stem.replace("_top_level", "").replace("_seafloor", "")
+        for chunk in file_path.parent.glob(f"{stem}_chunk_*.nc"):
+            try:
+                chunk.unlink()
+            except OSError as e:
+                self._log_error(f"Could not remove stale chunk {chunk}: {e}")
+
+    def _is_valid_weight_file(self, weight_path: Path) -> bool:
+        """Return False for missing, empty, or corrupt cached weight files."""
+        if not weight_path.exists() or weight_path.stat().st_size == 0:
+            return False
+        try:
+            with xa.open_dataset(weight_path, decode_times=False) as ds:
+                return len(ds.dims) > 0
+        except Exception:
+            return False
+
+    def _invalidate_weight_file(self, weight_path: Path) -> None:
+        if weight_path.exists():
+            try:
+                weight_path.unlink()
+            except OSError:
+                pass
     
     def _generate_output_filename(
         self,
@@ -816,26 +934,8 @@ class CDORegridPipeline:
         return name.replace(input_path.suffix, "_regridded" + input_path.suffix)
     
     def _get_representative_file(self, input_files: list[Path]) -> Optional[Path]:
-        """Get a representative file from a list of files for resolution calculation.
-        
-        Args:
-            input_files (list[Path]): List of input files
-            
-        Returns:
-            Optional[Path]: A representative file, or None if no suitable file found
-        """
-        if not input_files:
-            return None
-            
-        for file_path in input_files:
-            try:
-                with xa.open_dataset(file_path, decode_times=False) as ds:
-                    if 'nominal_resolution' in ds.attrs:    # try to find a file with nominal_resolution attribute
-                        return file_path
-            except Exception:
-                continue
-                
-        return input_files[0]   # if no file has nominal_resolution, return the first file 
+        """Get a representative file from a list of files for resolution calculation."""
+        return pick_representative_file(input_files)
     
     def _calculate_target_resolution(self, input_file: Path) -> tuple[float, float]:
         """Calculate target resolution based on dataset's nominal_resolution attribute.
@@ -883,10 +983,17 @@ class CDORegridPipeline:
         if representative_file and representative_file.exists():
             lon_res, lat_res = self._calculate_target_resolution(representative_file)
             if lon_res == 9999.0 or lat_res == 9999.0:
-                # fall back to pipeline's target resolution
-                lon_res, lat_res = self.target_resolution
-                if self.verbose_diagnostics:
-                    self.console.print(f"[yellow]Using pipeline target resolution: {lon_res}° x {lat_res}°[/yellow]")
+                if (
+                    hasattr(self, "_representative_file")
+                    and self._representative_file
+                    and self._representative_file.exists()
+                    and self._representative_file != representative_file
+                ):
+                    lon_res, lat_res = self._calculate_target_resolution(self._representative_file)
+                if lon_res == 9999.0 or lat_res == 9999.0:
+                    lon_res, lat_res = self.target_resolution
+                    if self.verbose_diagnostics:
+                        self.console.print(f"[yellow]Using pipeline target resolution: {lon_res}° x {lat_res}°[/yellow]")
             else:
                 if self.verbose_diagnostics:
                     self.console.print(f"[green]Calculated target resolution from {representative_file.name}: {lon_res:.3f}° x {lat_res:.3f}° (to 3 decimal places)[/green]")
@@ -930,7 +1037,6 @@ ysize = {ysize}"""
         
         else:
             raise ValueError(f"Unsupported target grid type: {self.target_grid}")
-    
     def _should_chunk_file(self, file_info: dict) -> bool:
         """Determine if a file should be processed in chunks based on file size, memory usage, and time steps.
         
@@ -1030,7 +1136,7 @@ ysize = {ysize}"""
                     
                     # Verify chunk file was created and is not empty
                     if not chunk_path.exists() or chunk_path.stat().st_size == 0:
-                        self.logger.error(f"Chunk file {chunk_path.name} is empty or was not created")
+                        self._log_error(f"Chunk file {chunk_path.name} is empty or was not created")
                         if chunk_path.exists():
                             chunk_path.unlink()
                         continue
@@ -1040,7 +1146,10 @@ ysize = {ysize}"""
                     chunk_files.append(chunk_path)
                     
                 except Exception as chunk_error:
-                    self.logger.error(f"Failed to write chunk {i} for {file_path.name}: {chunk_error}")
+                    self._log_error(
+                        f"Failed to write chunk {i} for {file_path.name}: {chunk_error}",
+                        exc=chunk_error if isinstance(chunk_error, BaseException) else None,
+                    )
                     # Clean up failed chunk file if it was partially created
                     if chunk_path.exists():
                         try:
@@ -1057,8 +1166,7 @@ ysize = {ysize}"""
             return chunk_files
             
         except Exception as e:
-            self.logger.error(f"Failed to chunk file {file_path}: {e}")
-            self.logger.error(f"Full traceback: {traceback.format_exc()}")
+            self._log_error(f"Failed to chunk file {file_path}: {e}", exc=e)
             
             # Clean up any chunk files that were created before the error
             for chunk_file in chunk_files:
@@ -1067,7 +1175,10 @@ ysize = {ysize}"""
                         self.logger.warning(f"Cleaning up incomplete chunk file: {chunk_file.name}")
                         chunk_file.unlink()
                 except Exception as cleanup_error:
-                    self.logger.error(f"Failed to clean up chunk file {chunk_file.name}: {cleanup_error}")
+                    self._log_error(
+                        f"Failed to clean up chunk file {chunk_file.name}: {cleanup_error}",
+                        exc=cleanup_error,
+                    )
             
             return [file_path]
         finally:
@@ -1284,8 +1395,7 @@ ysize = {ysize}"""
             return seafloor_path
             
         except Exception as e:
-            self.logger.error(f"Failed to extract seafloor values from {file_path}: {e}")
-            self.logger.error(f"Full traceback: {traceback.format_exc()}")
+            self._log_error(f"Failed to extract seafloor values from {file_path}: {e}", exc=e)
             # Return None or raise exception to indicate failure
             # Returning original file_path would be misleading
             raise RuntimeError(f"Seafloor extraction failed for {file_path.name}: {e}") from e
@@ -1315,7 +1425,7 @@ ysize = {ysize}"""
                 )
                 return prepared_path
             except Exception as e:
-                self.logger.error(f"Seafloor extraction failed, cannot proceed with regridding: {e}")
+                self._log_error(f"Seafloor extraction failed, cannot proceed with regridding: {e}", exc=e)
                 raise
 
         if not self.extract_surface:
@@ -1327,7 +1437,7 @@ ysize = {ysize}"""
             ds = xa.open_dataset(file_path, decode_times=False)
             has_level, level_dims, level_count = self._whether_multi_level(dict(ds.sizes))
             if not isinstance(level_dims, list):
-                self.logger.error(f"level_dims is not a list: {type(level_dims)} = {level_dims}")
+                self._log_error(f"level_dims is not a list: {type(level_dims)} = {level_dims}")
                 return file_path
             if not has_level or level_count == 0:
                 return file_path
@@ -1349,7 +1459,7 @@ ysize = {ysize}"""
             return prepared_path
         except Exception as e:
             self.logger.warning(f"Could not prepare file {file_path}: {e}")
-            self.logger.error(f"Full traceback: {traceback.format_exc()}")
+            self._log_error(f"Could not prepare file {file_path}: {e}", exc=e)
             return file_path
 
     def _ensure_top_level_file_for_chunking(self, file_path: Path) -> Path:
@@ -1412,6 +1522,7 @@ ysize = {ysize}"""
         grid_signature: str,
         grid_type: str,
         chunk_files: list[Path],
+        weight_cache_dir: Optional[Path] = None,
     ) -> bool:
         """Regrid a file that has been split into chunks, with optional parallel processing.
         
@@ -1425,78 +1536,66 @@ ysize = {ysize}"""
         Returns (bool): True if successful, False otherwise
         """
         try:
+            if weight_cache_dir is not None:
+                self.weight_cache_dir = Path(weight_cache_dir)
+                self.weight_cache_dir.mkdir(parents=True, exist_ok=True)
+
             weight_path = self._get_weight_path(grid_signature)
             grid_desc = self._generate_target_grid_description(input_path)
-            
+
             with tempfile.TemporaryDirectory() as tmpdir:
                 tmpdir = Path(tmpdir)
                 grid_file = tmpdir / "target_grid.txt"
-                
-                # write target grid description to temporary directory
+
                 with open(grid_file, 'w') as f:
                     f.write(grid_desc)
-                
-                # Check if weights exist and we may use cache - if not, generate from first chunk
-                weights_exist = self.use_regrid_cache and weight_path.exists()
-                
+
+                weights_exist = (
+                    self.use_regrid_cache and self._is_valid_weight_file(weight_path)
+                )
+
                 if not weights_exist and len(chunk_files) > 0:
-                    # Process first chunk to generate weights
                     if self.verbose_diagnostics:
-                        self.console.print(f"[blue]Generating weights from first chunk...[/blue]")
+                        self.console.print("[blue]Generating weights from first chunk...[/blue]")
                     first_chunk_output = tmpdir / "chunk_000.nc"
-                    self._regrid_without_weights(chunk_files[0], first_chunk_output, grid_file, grid_type)
-                    # Save weights for future use
-                    self._save_weights(chunk_files[0], weight_path, grid_file)
-                    weights_exist = True
+                    if not self._regrid_without_weights(
+                        chunk_files[0], first_chunk_output, grid_file, grid_type
+                    ):
+                        self._log_error(
+                            f"Failed to regrid first chunk for weights: {chunk_files[0]}"
+                        )
+                        return False
+                    if not self._save_weights(chunk_files[0], weight_path, grid_file):
+                        self._log_error(f"Failed to save weights to {weight_path}")
+                        return False
+                    weights_exist = self._is_valid_weight_file(weight_path)
+                    if not weights_exist:
+                        self._log_error(f"Weight file invalid after save: {weight_path}")
+                        return False
                     if self.verbose_diagnostics:
-                        self.console.print(f"[green]Weights generated and saved[/green]")
-                
-                # Process remaining chunks (in parallel if enabled)
+                        self.console.print("[green]Weights generated and saved[/green]")
+
                 chunk_outputs = []
-                
-                if weights_exist and self.enable_parallel and len(chunk_files) > 1 and self.max_workers and self.max_workers > 1:
-                    # Parallel processing of chunks
-                    if self.verbose_diagnostics:
-                        self.console.print(f"[green]Processing {len(chunk_files)} chunks in parallel with {self.max_workers} workers[/green]")
-                    
-                    # Prepare arguments for parallel processing
-                    chunk_args = [
-                        (i, chunk_file, str(tmpdir), str(grid_file), str(weight_path))
-                        for i, chunk_file in enumerate(chunk_files)
-                    ]
-                    
-                    # Process chunks in parallel
-                    chunk_results = []
-                    with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
-                        futures = [executor.submit(_process_chunk_standalone, args) for args in chunk_args]
-                        for future in futures:
-                            chunk_idx, chunk_output, success, error = future.result()
-                            if success:
-                                chunk_results.append((chunk_idx, Path(chunk_output)))
-                                self.stats['chunks_processed'] += 1
-                            else:
-                                self.logger.error(f"Failed to process chunk {chunk_idx}: {error}")
-                                return False
-                    
-                    # Sort by chunk index to maintain order
-                    chunk_results.sort(key=lambda x: x[0])
-                    chunk_outputs = [output for _, output in chunk_results]
-                    
-                else:
-                    # Sequential processing (fallback or if parallel disabled)
-                    if self.verbose_diagnostics and len(chunk_files) > 1:
-                        self.console.print(f"[yellow]Processing {len(chunk_files)} chunks sequentially[/yellow]")
-                    
-                    for i, chunk_file in enumerate(chunk_files):
-                        chunk_output = tmpdir / f"chunk_{i:03d}.nc"
-                        
-                        if weights_exist:
-                            self._regrid_with_weights(chunk_file, chunk_output, grid_file, weight_path)
-                        else:
-                            self._regrid_without_weights(chunk_file, chunk_output, grid_file, grid_type)
-                        
-                        chunk_outputs.append(chunk_output)
-                        self.stats['chunks_processed'] += 1
+
+                for i, chunk_file in enumerate(chunk_files):
+                    chunk_output = tmpdir / f"chunk_{i:03d}.nc"
+
+                    if weights_exist:
+                        if not self._regrid_with_weights(
+                            chunk_file, chunk_output, grid_file, weight_path, grid_type
+                        ):
+                            self._log_error(
+                                f"Failed to regrid chunk {i} with weights: {chunk_file}"
+                            )
+                            return False
+                    elif not self._regrid_without_weights(
+                        chunk_file, chunk_output, grid_file, grid_type
+                    ):
+                        self._log_error(f"Failed to regrid chunk {i} without weights: {chunk_file}")
+                        return False
+
+                    chunk_outputs.append(chunk_output)
+                    self.stats['chunks_processed'] += 1
                 
                 # combine chunks into single file
                 if len(chunk_outputs) > 1:
@@ -1518,8 +1617,7 @@ ysize = {ysize}"""
                 return True
                 
         except Exception as e:
-            self.logger.error(f"Failed to regrid chunked file {input_path}: {e}")
-            self.logger.error(f"Full traceback: {traceback.format_exc()}")
+            self._log_error(f"Failed to regrid chunked file {input_path}: {e}", exc=e)
             
             # Clean up chunk files even if regridding failed
             for chunk_file in chunk_files:
@@ -1528,7 +1626,10 @@ ysize = {ysize}"""
                         self.logger.warning(f"Cleaning up chunk file after error: {chunk_file.name}")
                         chunk_file.unlink()
                     except Exception as cleanup_error:
-                        self.logger.error(f"Failed to clean up chunk file {chunk_file.name}: {cleanup_error}")
+                        self._log_error(
+                        f"Failed to clean up chunk file {chunk_file.name}: {cleanup_error}",
+                        exc=cleanup_error,
+                    )
             
             return False
 
@@ -1551,44 +1652,95 @@ ysize = {ysize}"""
                 ds.close()
                 
         except Exception as e:
-            self.logger.error(f"Failed to combine chunks: {e}")
-            self.logger.error(f"Full traceback: {traceback.format_exc()}")
+            self._log_error(f"Failed to combine chunks: {e}", exc=e)
             return False
     
-    def _regrid_with_weights(self, input_path: Path, output_path: Path, grid_file: Path, weight_path: Path):
-        """Regrid using existing weights.
-        
-        Args:
-        - input_path (Path): Path to the input file
-        - output_path (Path): Path to the output file
-        - grid_file (Path): Path to the grid file
-        - weight_path (Path): Path to the weight file
-        """
+    def _regrid_with_weights(
+        self,
+        input_path: Path,
+        output_path: Path,
+        grid_file: Path,
+        weight_path: Path,
+        grid_type: str = "structured",
+        _allow_regenerate: bool = True,
+    ) -> bool:
+        """Regrid using existing weights; regenerate once if cache is missing or corrupt."""
         try:
-            self.cdo.remap(
-                str(grid_file),
-                str(weight_path),
-                input=str(input_path),
-                output=str(output_path),
-            )
+            with _weight_file_lock(weight_path):
+                if not self._is_valid_weight_file(weight_path):
+                    if not _allow_regenerate:
+                        return False
+                    self._invalidate_weight_file(weight_path)
+                    if not self._regrid_without_weights(
+                        input_path, output_path, grid_file, grid_type
+                    ):
+                        return False
+                    self._save_weights(input_path, weight_path, grid_file)
+                    return output_path.exists() and output_path.stat().st_size > 0
+
+                self.cdo.remap(
+                    str(grid_file),
+                    str(weight_path),
+                    input=str(input_path),
+                    output=str(output_path),
+                )
             return True
         except Exception as e:
-            self.logger.error(f"Failed to regrid {input_path} with weights: {e}")
-            self.logger.error(f"Full traceback: {traceback.format_exc()}")
+            err = str(e).lower()
+            corrupt = (
+                "hdf error" in err
+                or "nc_open failed" in err
+                or "no such file" in err
+            )
+            if corrupt:
+                self._invalidate_weight_file(weight_path)
+            self._log_error(f"Failed to regrid {input_path} with weights: {e}", exc=e)
+            if corrupt and _allow_regenerate:
+                return self._regrid_with_weights(
+                    input_path,
+                    output_path,
+                    grid_file,
+                    weight_path,
+                    grid_type=grid_type,
+                    _allow_regenerate=False,
+                )
             return False
     
     def _regrid_without_weights(self, input_path: Path, output_path: Path, grid_file: Path, grid_type: str):
-        """Regrid without existing weights using appropriate method. Conservative remapping is used for all grid types to preserve mass/volume."""
+        """Regrid without existing weights; conservative if corners exist, else bilinear."""
+        file_info = self._get_file_info(input_path)
+        has_corners = file_info.get(
+            "has_grid_corners", grid_type == "structured"
+        )
+        remap_op, _ = self._regrid_operators(grid_type, has_corners)
         try:
-            self.cdo.remapcon(
+            getattr(self.cdo, remap_op)(
                 str(grid_file),
                 input=str(input_path),
                 output=str(output_path),
             )
             return True
         except Exception as e:
-            self.logger.error(f"Failed to regrid {input_path} of type {grid_type} without weights: {e}")
-            self.logger.error(f"Full traceback: {traceback.format_exc()}")
+            err = str(e).lower()
+            if remap_op == "remapcon" and "corner coordinates missing" in err:
+                try:
+                    self.cdo.remapbil(
+                        str(grid_file),
+                        input=str(input_path),
+                        output=str(output_path),
+                    )
+                    return True
+                except Exception as fallback_error:
+                    self._log_error(
+                        f"Failed to regrid {input_path} of type {grid_type} "
+                        f"without weights (remapbil fallback): {fallback_error}",
+                        exc=fallback_error,
+                    )
+                    return False
+            self._log_error(
+                f"Failed to regrid {input_path} of type {grid_type} without weights: {e}",
+                exc=e,
+            )
             return False
     
     def _regrid_single_file(
@@ -1612,46 +1764,44 @@ ysize = {ysize}"""
         Returns (bool): True if successful, False otherwise
         """
         try:
-            # get weight file path
             weight_path = self._get_weight_path(grid_signature)
-            
-            # generate target grid description
             grid_desc = self._generate_target_grid_description(input_path)
-            
+
             with tempfile.TemporaryDirectory() as tmpdir:
                 tmpdir = Path(tmpdir)
                 grid_file = tmpdir / "target_grid.txt"
-                
-                # write grid description
                 with open(grid_file, 'w') as f:
                     f.write(grid_desc)
-                
-                # check to see whether we should reuse weights (respect use_regrid_cache)
-                if self.use_regrid_cache and weight_path.exists() and not force_regenerate_weights:
-                    self.console.print(f"[green]Reusing weights: {weight_path.name}[/green]") if self.verbose_diagnostics else None
-                    self.stats['weights_reused'] += 1
-                    # use existing weights
-                    self._regrid_with_weights(input_path, output_path, grid_file, weight_path)
-                else:
-                    # generate new weights
-                    self.console.print(f"[yellow]Generating new weights: {weight_path.name}[/yellow]") if self.verbose_diagnostics else None
-                    # regrid without weights
-                    self._regrid_without_weights(input_path, output_path, grid_file, grid_type)
-                    # save weights for future use
+
+                used_cached_weights = False
+                if self.use_regrid_cache and not force_regenerate_weights:
+                    if self._is_valid_weight_file(weight_path):
+                        used_cached_weights = True
+                        if self.verbose_diagnostics:
+                            self.console.print(f"[green]Reusing weights: {weight_path.name}[/green]")
+                        self.stats['weights_reused'] += 1
+                        if not self._regrid_with_weights(
+                            input_path, output_path, grid_file, weight_path, grid_type
+                        ):
+                            used_cached_weights = False
+                    else:
+                        self._invalidate_weight_file(weight_path)
+
+                if not used_cached_weights:
+                    if self.verbose_diagnostics:
+                        self.console.print(f"[yellow]Generating new weights: {weight_path.name}[/yellow]")
+                    if not self._regrid_without_weights(input_path, output_path, grid_file, grid_type):
+                        return False
                     self._save_weights(input_path, weight_path, grid_file)
                     self.stats['weights_generated'] += 1
-                
-                # verify output file exists and is not empty
+
                 if output_path.exists() and output_path.stat().st_size > 0:
                     return True
-                else:
-                    self.logger.error(f"Output file is empty or missing: {output_path}")
-                    self.logger.error(f"Full traceback: {traceback.format_exc()}")
-                    return False
-                    
+                self._log_error(f"Output file is empty or missing: {output_path}")
+                return False
+
         except Exception as e:
-            self.logger.error(f"Failed to regrid {input_path}: {e}")
-            self.logger.error(f"Full traceback: {traceback.format_exc()}")
+            self._log_error(f"Failed to regrid {input_path}: {e}", exc=e)
             return False
     
     def _save_weights(self, input_path: Path, weight_path: Path, grid_file: Path) -> None:
@@ -1665,22 +1815,37 @@ ysize = {ysize}"""
         Returns (None): None
         """
         try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                tmpdir = Path(tmpdir)
-                temp_weights = tmpdir / "temp_weights.nc"
-                
-                self.cdo.gencon(
-                    str(grid_file),
-                    input=str(input_path),
-                    output=str(temp_weights),
-                )
-                    
-                # copy from tmpdir to weight_path, preserving dataset attributes
-                shutil.copy2(temp_weights, weight_path)
-                return True
+            file_info = self._get_file_info(input_path)
+            _, gen_op = self._regrid_operators(
+                file_info.get("grid_type", "unknown"),
+                file_info.get("has_grid_corners", False),
+            )
+            weight_path.parent.mkdir(parents=True, exist_ok=True)
+            with _weight_file_lock(weight_path):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    tmpdir = Path(tmpdir)
+                    temp_weights = tmpdir / "temp_weights.nc"
+                    try:
+                        getattr(self.cdo, gen_op)(
+                            str(grid_file),
+                            input=str(input_path),
+                            output=str(temp_weights),
+                        )
+                    except Exception as e:
+                        if gen_op == "gencon" and "corner coordinates missing" in str(e).lower():
+                            self.cdo.genbil(
+                                str(grid_file),
+                                input=str(input_path),
+                                output=str(temp_weights),
+                            )
+                        else:
+                            raise
+                    staging = weight_path.with_suffix(weight_path.suffix + ".part")
+                    shutil.copy2(temp_weights, staging)
+                    os.replace(staging, weight_path)
+            return True
         except Exception as e:
             self.logger.warning(f"Could not save weights: {e}")
-            self.logger.error(f"Full traceback: {traceback.format_exc()}")
             return False
     
     def regrid_file(
@@ -1703,10 +1868,13 @@ ysize = {ysize}"""
         Returns (bool): True if successful, False otherwise
         """
         if not input_path.exists():
-            self.logger.error(f"Input file does not exist: {input_path}")
-            self.logger.error(f"Full traceback: {traceback.format_exc()}")
+            self._log_error(f"Input file does not exist: {input_path}")
             return False
-        
+
+        self.weight_cache_dir = weight_cache_dir_for_input(input_path)
+        self.weight_cache_dir.mkdir(parents=True, exist_ok=True)
+        init_regrid_error_log(self._error_log_path)
+
         file_info = self._get_file_info(input_path)
         regrid_mode = "seafloor" if self.extract_seafloor else ("surface" if self.extract_surface else "complete")
         if ui:
@@ -1725,7 +1893,7 @@ ysize = {ysize}"""
                 try:
                     output_path.unlink()
                 except Exception as e:
-                    self.logger.error(f"Failed to remove existing file {output_path}: {e}")
+                    self._log_error(f"Failed to remove existing file {output_path}: {e}", exc=e)
                     if ui:
                         ui.complete_file(input_path, success=False, message=f"Failed to remove existing file: {e}")
                     return False
@@ -1761,7 +1929,7 @@ ysize = {ysize}"""
             )
 
         if not self._is_valid_prepared_file(prepared_path):
-            self.logger.error(
+            self._log_error(
                 f"Skipping regridding: prepared file is empty or invalid (CDO would report 'No arrays found'): {prepared_path.name}"
             )
             if ui:
@@ -1798,6 +1966,7 @@ ysize = {ysize}"""
                 # all levels. Ensure we chunk a top-level-only file.
                 if self.extract_surface and prepared_path == input_path:
                     prepared_path = self._ensure_top_level_file_for_chunking(input_path)
+                self._cleanup_stale_chunks_for_file(prepared_path)
                 name_suffix = "_top_level" if self.extract_surface else ("_seafloor" if self.extract_seafloor else None)
                 chunk_files = self._chunk_file_by_time(prepared_path, name_suffix=name_suffix)
                 if ui:
@@ -1808,6 +1977,7 @@ ysize = {ysize}"""
                     grid_signature,
                     grid_type,
                     chunk_files,
+                    weight_cache_dir=self.weight_cache_dir,
                 )
             else:
                 if ui:
@@ -1842,8 +2012,7 @@ ysize = {ysize}"""
             return success
             
         except Exception as e:
-            self.logger.error(f"Error processing {input_path}: {e}")
-            self.logger.error(f"Full traceback: {traceback.format_exc()}")
+            self._log_error(f"Error processing {input_path}: {e}", exc=e)
             self.stats['errors'] += 1
             if ui:
                 ui.complete_file(input_path, success=False, message=f"Error: {str(e)}")
@@ -1880,11 +2049,13 @@ ysize = {ysize}"""
             self.console.print(f"[yellow]Input is a single file, will be processed sequentially[/yellow]") if self.verbose_diagnostics else None
         # Exclude weight/cache files from the batch
         input_files = [f for f in input_files if not _is_weights_or_cache_file(f)]
-        # determine representative file for resolution calculation
-        representative_file = self._get_representative_file(input_files)
-        if representative_file and self.verbose:
-            self.console.print(f"[blue]Using representative file for resolution calculation: {representative_file.name}[/blue]")
-            
+        representative_by_dir = representative_files_by_directory(input_files)
+        if representative_by_dir and self.verbose:
+            self.console.print(
+                f"[blue]Resolution representatives: {len(representative_by_dir)} "
+                f"leaf director{'y' if len(representative_by_dir) == 1 else 'ies'}[/blue]"
+            )
+
         # clean up problematic files (_top_level and _chunk_) first
         input_files = self._cleanup_problematic_files(input_files)
 
@@ -1950,11 +2121,7 @@ ysize = {ysize}"""
         # Always redirect pipeline errors (seafloor, regrid, etc.) to a log file so they are
         # captured even when running quiet or without UI
         if input_files:
-            from esgpull.esgpullplus import config
-            log_dir = config.log_dir
-            log_dir.mkdir(parents=True, exist_ok=True)
-            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            self._error_log_path = log_dir / f"regrid_errors_{timestamp}.log"
+            self._error_log_path = init_regrid_error_log()
             self.set_error_log_path(self._error_log_path)
             if use_ui and self.verbose:
                 self.console.print(f"[dim]Errors logged to: {self._error_log_path}[/dim]")
@@ -1963,7 +2130,9 @@ ysize = {ysize}"""
         
         if not self.enable_parallel or len(input_files) < 2 or self.max_workers in [None, 1]:
             # process sequentially
-            results = self._regrid_batch_sequential(input_files, output_dir, group_by_directory, overwrite, use_ui)
+            results = self._regrid_batch_sequential(
+                input_files, output_dir, group_by_directory, overwrite, use_ui, representative_by_dir
+            )
             self.end_time = fileops.print_timestamp(self.console, "END")
             return results
         
@@ -1989,14 +2158,15 @@ ysize = {ysize}"""
                 
                 # submit each file individually for parallel processing
                 for file_path in input_files:
-                        # submit individual file for processing
+                        dir_representative = representative_by_dir.get(file_path.parent)
+                        file_weight_cache = weight_cache_dir_for_input(file_path)
                         future = executor.submit(
                             _process_single_file_standalone,
                             file_path,
                             output_dir,
                             self.target_resolution,
                             self.target_grid,
-                            self.weight_cache_dir,
+                            file_weight_cache,
                             self.extract_surface,
                             self.extract_seafloor,
                             self.use_regrid_cache,
@@ -2005,7 +2175,7 @@ ysize = {ysize}"""
                             self.chunk_size_gb,
                             self.enable_chunking,
                             overwrite,
-                            representative_file,
+                            dir_representative,
                             self.verbose,
                             self._error_log_path,
                         )
@@ -2060,10 +2230,11 @@ ysize = {ysize}"""
                 # update main pipeline statistics
                 self.stats.update(combined_stats)
         except Exception as e:
-            self.logger.error(f"Error processing batch in parallel: {e}")
-            self.logger.error(f"Full traceback: {traceback.format_exc()}")
+            self._log_error(f"Error processing batch in parallel: {e}", exc=e)
             self.logger.warning(f"Falling back to sequential processing")
-            results = self._regrid_batch_sequential(input_files, output_dir, group_by_directory, overwrite, use_ui)
+            results = self._regrid_batch_sequential(
+                input_files, output_dir, group_by_directory, overwrite, use_ui, representative_by_dir
+            )
             self.end_time = fileops.print_timestamp(self.console, "END")
             return results
         finally:
@@ -2092,6 +2263,7 @@ ysize = {ysize}"""
         group_by_directory: bool = True,
         overwrite: bool = False,
         use_ui: bool = True,
+        representative_by_dir: Optional[dict[Path, Path]] = None,
     ) -> dict[str, list[Path]]:
         """Sequential batch processing fallback. Used if parallel processing fails or is not enabled, if there is only one file, or if the number of workers is not specified or is set to 1.
         
@@ -2141,10 +2313,14 @@ ysize = {ysize}"""
             if self.verbose:
                 self.console.print(f"\n[blue]Processing group: {group_name}[/blue]")
                 self.console.print(f"[blue]Files in group: {len(files)}[/blue]")
-            
+
             # process files in group
             for file_path in files:
                 try:
+                    dir_representative = (representative_by_dir or {}).get(file_path.parent)
+                    if dir_representative:
+                        self._representative_file = dir_representative
+
                     # Use lightweight check for has_level to avoid expensive full file analysis
                     has_level = self._has_level_lightweight(file_path)
                     
@@ -2180,8 +2356,7 @@ ysize = {ysize}"""
                             self.console.print(f"[red]Failed: {file_path.name}[/red]")
                         
                 except Exception as e:
-                    self.logger.error(f"Error processing {file_path}: {e}")
-                    self.logger.error(f"Full traceback: {traceback.format_exc()}")
+                    self._log_error(f"Error processing {file_path}: {e}", exc=e)
                     results['failed'].append(file_path)
                     if ui:
                         ui.complete_file(file_path, success=False, message=f"Error: {str(e)}")
@@ -2265,12 +2440,11 @@ ysize = {ysize}"""
                     if self.verbose:
                         self.console.print(f"[cyan]Cleaned up {weight_file.name}[/cyan]")
                 except Exception as e:
-                    self.logger.error(f"Error deleting weight file {weight_file}: {e}")
+                    self._log_error(f"Error deleting weight file {weight_file}: {e}", exc=e)
             if self.verbose:
                 self.console.print(f"[green]Cleaned up {len(weight_files)} weight file(s).[/green]")
         except Exception as e:
-            self.logger.error(f"Error cleaning up weights: {e}")
-            self.logger.error(f"Full traceback: {traceback.format_exc()}")
+            self._log_error(f"Error cleaning up weights: {e}", exc=e)
 
 
 class MemoryMonitor:
@@ -2397,11 +2571,7 @@ def regrid_single_file(
             input_path, has_level, extract_surface, extract_seafloor
         )
         output_path = output_dir / filename
-    # Ensure pipeline errors (seafloor, regrid, etc.) go to a log file
-    from esgpull.esgpullplus import config
-    config.log_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    error_log_path = config.log_dir / f"regrid_errors_{timestamp}.log"
+    error_log_path = init_regrid_error_log()
     pipeline.set_error_log_path(error_log_path)
     # Initialize UI if requested
     ui = None
@@ -2467,7 +2637,7 @@ def regrid_single_file_both_levels(
     overwrite : bool
         Overwrite existing outputs.
     weight_cache_dir : Path, optional
-        Directory for regrid weight cache. If None, uses cwd / "cdo_weights".
+        Directory for regrid weight cache. If None, each input file uses ``<input_dir>/cdo_weights``.
 
     Returns
     -------
@@ -2633,12 +2803,69 @@ def _is_intermediate_nc(path: Path) -> bool:
     )
 
 
+def parse_variable_list(variables: Optional[list[str] | str]) -> Optional[set[str]]:
+    """Parse CLI/YAML variable filter into a lowercase set, or None if unset."""
+    if not variables:
+        return None
+    tokens: list[str] = []
+    if isinstance(variables, str):
+        tokens = variables.split(",")
+    else:
+        for item in variables:
+            tokens.extend(item.split(","))
+    parsed = {token.strip().lower() for token in tokens if token.strip()}
+    return parsed or None
+
+
+def get_cmip_variable_name(file_path: Path) -> str:
+    """CMIP6 filename prefix before the first underscore (e.g. tos from tos_Omon_...)."""
+    return file_path.stem.split("_")[0].lower()
+
+
+def filter_files_by_variables(
+    files: list[Path],
+    variables: Optional[list[str] | str],
+) -> list[Path]:
+    """Keep only files whose CMIP variable prefix is in *variables*."""
+    allowed = parse_variable_list(variables)
+    if not allowed:
+        return files
+    return [f for f in files if get_cmip_variable_name(f) in allowed]
+
+
+def pick_representative_file(input_files: list[Path]) -> Optional[Path]:
+    """Pick a file with nominal_resolution metadata, else the first file in the group."""
+    if not input_files:
+        return None
+    for file_path in input_files:
+        try:
+            with xa.open_dataset(file_path, decode_times=False) as ds:
+                if "nominal_resolution" in ds.attrs:
+                    return file_path
+        except Exception:
+            continue
+    return input_files[0]
+
+
+def representative_files_by_directory(files: list[Path]) -> dict[Path, Path]:
+    """Map each file's parent directory to a representative file for resolution."""
+    by_dir: dict[Path, list[Path]] = {}
+    for file_path in files:
+        by_dir.setdefault(file_path.parent, []).append(file_path)
+    return {
+        parent: rep
+        for parent, group_files in by_dir.items()
+        if (rep := pick_representative_file(group_files)) is not None
+    }
+
+
 def regrid_directory(
     input_dir: Path,
     include_subdirectories: bool = False,
     output_dir: Optional[Path] = None,
     target_resolution: tuple[float, float] = None,
     file_pattern: str = "*.nc",
+    variables: Optional[list[str] | str] = None,
     extract_surface: bool = False,
     extract_seafloor: bool = False,
     use_regrid_cache: bool = True,
@@ -2658,6 +2885,7 @@ def regrid_directory(
     - output_dir (Path): Output directory for regridded files
     - target_resolution (tuple): Target resolution as (lon_res, lat_res)
     - file_pattern (str): File pattern to match (e.g., "*.nc", "*.nc4")
+    - variables (list[str] | str, optional): CMIP variable prefix(es) to process (e.g. ``tos`` or ``tos,uo``)
     - extract_surface (bool): Extract top level only and regrid that
     - extract_seafloor (bool): Extract seafloor values and regrid only that
     - use_regrid_cache (bool): Reuse existing regrid weight files
@@ -2677,10 +2905,16 @@ def regrid_directory(
     else:
         raw = list(input_dir.glob(file_pattern))
     input_files = [p for p in raw if not _is_intermediate_nc(p)]
+    input_files = filter_files_by_variables(input_files, variables)
 
     if not input_files:
-        print(f"No files found matching pattern '{file_pattern}' in {input_dir}")
+        var_msg = f" and variables {sorted(parse_variable_list(variables) or [])}" if variables else ""
+        print(f"No files found matching pattern '{file_pattern}'{var_msg} in {input_dir}")
         return {"successful": [], "failed": [], "skipped": []}
+
+    error_log_path = init_regrid_error_log()
+    if verbose:
+        print(f"Regrid errors log: {error_log_path}")
 
     # create pipeline
     pipeline = CDORegridPipeline(
@@ -2694,7 +2928,8 @@ def regrid_directory(
         max_workers=max_workers,
         enable_parallel=enable_parallel,
     )
-    
+    pipeline.set_error_log_path(error_log_path)
+
     # process files
     results = pipeline.regrid_batch(input_files, output_dir, overwrite=overwrite, use_ui=use_ui)
     # print statistics
@@ -2709,6 +2944,7 @@ def regrid_directory_both_levels(
     output_dir: Optional[Path] = None,
     target_resolution: tuple[float, float] = (1.0, 1.0),
     file_pattern: str = "*.nc",
+    variables: Optional[list[str] | str] = None,
     verbose: bool = True,
     overwrite: bool = False,
     max_workers: Optional[int] = 4,
@@ -2760,9 +2996,11 @@ def regrid_directory_both_levels(
     else:
         raw = list(input_dir.glob(file_pattern))
     input_files = [p for p in raw if not _is_intermediate_nc(p)]
+    input_files = filter_files_by_variables(input_files, variables)
 
     if not input_files:
-        print(f"No files found matching pattern '{file_pattern}' in {input_dir}")
+        var_msg = f" and variables {sorted(parse_variable_list(variables) or [])}" if variables else ""
+        print(f"No files found matching pattern '{file_pattern}'{var_msg} in {input_dir}")
         return {"successful": [], "failed": [], "skipped": []}
 
     results: dict[str, list[Path]] = {
@@ -2872,6 +3110,10 @@ if __name__ == "__main__":
     parser.add_argument("-r", "--resolution", nargs=2, type=float, default=[1.0, 1.0],
                        help="Target resolution (lon_res lat_res)")
     parser.add_argument("-p", "--pattern", default="*.nc", help="File pattern (for directories)")
+    parser.add_argument(
+        "--variable", "-V", nargs="+", default=None,
+        help="CMIP variable prefix(es) to regrid (e.g. tos or tos uo). Comma-separated values allowed.",
+    )
     parser.add_argument("--include-subdirectories", action="store_true", default=True, help="Include subdirectories")
     parser.add_argument("--extract-surface", action="store_true", default=False,
                         help="Extract top level only and regrid that (surface)")
@@ -2887,7 +3129,7 @@ if __name__ == "__main__":
     parser.add_argument("--verbose-max", action="store_true", default=False,
                         help="Maximum verbosity: print Grid type, File size, Large file messages")
     parser.add_argument("--quiet", action="store_true", help="Disable verbose output")
-    parser.add_argument("-w", "--max-workers", default=4, type=int, help="Maximum parallel workers")
+    parser.add_argument("--max-workers", "-w", default=4, type=int, help="Maximum parallel workers")
     parser.add_argument("--chunk-size-gb", type=float, default=2.0,
                        help="Maximum chunk size in GB")
     parser.add_argument("--max-memory-gb", default=8.0, type=float, help="Maximum memory usage in GB")
@@ -2923,8 +3165,14 @@ if __name__ == "__main__":
     #     # exit after cleanup
     #     exit(0)
     
+    variables = args.variable
+
     # determine if input is file or directory
     if args.input.is_file():
+        if variables and not filter_files_by_variables([args.input], variables):
+            allowed = sorted(parse_variable_list(variables) or [])
+            print(f"Skipping {args.input.name}: variable '{get_cmip_variable_name(args.input)}' not in {allowed}")
+            raise SystemExit(0)
         # single file processing
         if args.extreme_levels:
             status = regrid_single_file_extreme_levels(
@@ -2968,6 +3216,7 @@ if __name__ == "__main__":
                 include_subdirectories=args.include_subdirectories,
                 target_resolution=tuple(args.resolution),
                 file_pattern=args.pattern,
+                variables=variables,
                 verbose=verbose,
                 overwrite=args.overwrite,
                 max_workers=args.max_workers,
@@ -2980,6 +3229,7 @@ if __name__ == "__main__":
                 include_subdirectories=args.include_subdirectories,
                 target_resolution=tuple(args.resolution),
                 file_pattern=args.pattern,
+                variables=variables,
                 extract_surface=args.extract_surface,
                 extract_seafloor=args.extract_seafloor,
                 use_regrid_cache=use_regrid_cache,
