@@ -1,8 +1,40 @@
 from pathlib import Path
 
 import pytest
+import xarray as xa
+import numpy as np
 
 from esgpull.esgpullplus import cdo_regrid as cr
+
+
+def test_regrid_operators_use_bilinear_without_corners():
+    pipeline = cr.CDORegridPipeline(verbose=False)
+    assert pipeline._regrid_operators("curvilinear", False) == ("remapbil", "genbil")
+    assert pipeline._regrid_operators("curvilinear", True) == ("remapcon", "gencon")
+    assert pipeline._regrid_operators("structured", False) == ("remapcon", "gencon")
+
+
+def test_has_grid_corners_detects_cf_bounds():
+    pipeline = cr.CDORegridPipeline(verbose=False)
+    ds = xa.Dataset(
+        coords={
+            "lat": ("lat", [0.0, 1.0]),
+            "lon": ("lon", [0.0, 1.0]),
+            "lat_bnds": (("lat", "bnds"), np.zeros((2, 2))),
+            "lon_bnds": (("lon", "bnds"), np.zeros((2, 2))),
+        }
+    )
+    ds["lat"].attrs["bounds"] = "lat_bnds"
+    ds["lon"].attrs["bounds"] = "lon_bnds"
+    assert pipeline._has_grid_corners(ds) is True
+
+    ds_no_bounds = xa.Dataset(
+        coords={
+            "latitude": (("j", "i"), np.zeros((2, 2))),
+            "longitude": (("j", "i"), np.zeros((2, 2))),
+        }
+    )
+    assert pipeline._has_grid_corners(ds_no_bounds) is False
 
 
 def test_process_single_file_standalone_skips_when_output_exists(tmp_path, monkeypatch):
@@ -106,4 +138,35 @@ def test_regrid_single_file_both_levels_uses_two_pipelines(monkeypatch, tmp_path
 
     # Both branches should report success
     assert status == {"top_level": True, "seafloor": True}
+
+
+def test_filter_files_by_variables():
+    files = [
+        Path("tos_Omon_model_historical.nc"),
+        Path("uo_Omon_model_historical.nc"),
+        Path("thetao_Omon_model_historical.nc"),
+    ]
+    assert cr.filter_files_by_variables(files, ["tos"]) == [files[0]]
+    assert cr.filter_files_by_variables(files, "tos,uo") == files[:2]
+    assert cr.filter_files_by_variables(files, None) == files
+
+
+def test_representative_files_by_directory(tmp_path, monkeypatch):
+    dir_a = tmp_path / "v20200101"
+    dir_b = tmp_path / "v20200202"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    file_a = dir_a / "tos_Omon_a.nc"
+    file_b = dir_b / "tos_Omon_b.nc"
+    file_a.write_bytes(b"a")
+    file_b.write_bytes(b"b")
+
+    def fake_pick(files):
+        return files[0]
+
+    monkeypatch.setattr(cr, "pick_representative_file", fake_pick, raising=True)
+
+    reps = cr.representative_files_by_directory([file_a, file_b])
+    assert reps[dir_a] == file_a
+    assert reps[dir_b] == file_b
 
