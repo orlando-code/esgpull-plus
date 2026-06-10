@@ -19,7 +19,34 @@ from esgpull.esgpullplus import api, fileops, config, utils
 from esgpull.esgpullplus.enhanced_file import EnhancedFile
 
 log = logging.getLogger(__name__)
-    
+
+# Facets that narrow a search; included in cache keys and applied when loading broad caches.
+_RESTRICTING_FACETS = (
+    "institution_id",
+    "source_id",
+    "member_id",
+    "grid_label",
+    "variant_label",
+)
+
+
+def normalize_search_criteria(criteria: dict) -> dict:
+    """Normalize YAML/CLI aliases (e.g. variant_id → member_id)."""
+    normalized = dict(criteria)
+    if normalized.get("variant_id") and not normalized.get("member_id"):
+        normalized["member_id"] = normalized.pop("variant_id")
+    else:
+        normalized.pop("variant_id", None)
+    return normalized
+
+
+def _parse_facet_values(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [v.strip() for v in value.split(",") if v.strip()]
+    return [str(value).strip()]
+
 
 class SearchResults:
     """
@@ -38,7 +65,7 @@ class SearchResults:
         if search_criteria is None:
             self.search_criteria = {}
         elif isinstance(search_criteria, dict):
-            self.search_criteria = search_criteria
+            self.search_criteria = normalize_search_criteria(search_criteria)
         else:
             raise TypeError(
                 f"search_criteria must be a dict, got {type(search_criteria).__name__}. "
@@ -71,7 +98,9 @@ class SearchResults:
     def load_config(self, config_path: str) -> None:
         """Load search criteria and metadata from a YAML configuration file."""
         config = fileops.read_yaml(config_path)
-        self.search_criteria = config.get("search_criteria", {})
+        self.search_criteria = normalize_search_criteria(
+            config.get("search_criteria", {})
+        )
         self.meta_criteria = config.get("meta_criteria", {})
         self.search_filter = self.search_criteria.get("filter", {})
         # Update search_results_dir if data_dir in meta_criteria
@@ -233,9 +262,38 @@ class SearchResults:
         table_id = criteria_to_use.get("table_id") or ""
         experiment_id = criteria_to_use.get("experiment_id") or ""
         variable = criteria_to_use.get("variable") or criteria_to_use.get("variable_id") or ""
-        return "SEARCH_" + str(project) + "_" + str(table_id) + "_" + str(experiment_id) + "_" + str(variable)
-        # return "SEARCH_" + "_".join(cleaned_str).replace(" ", "")
-    
+        parts = [project, table_id, experiment_id, variable]
+        for facet in _RESTRICTING_FACETS:
+            value = criteria_to_use.get(facet)
+            if value:
+                parts.append(clean_value(value))
+        return "SEARCH_" + "_".join(str(p) for p in parts if p)
+
+    def _apply_facet_filters(
+        self, df: pd.DataFrame, criteria: dict
+    ) -> pd.DataFrame:
+        """Filter cached/unfiltered results to match subsearch facets."""
+        if df is None or df.empty:
+            return df
+
+        out = df
+        skip_keys = {"filter"}
+        for key, raw in criteria.items():
+            if key in skip_keys or raw is None:
+                continue
+            col = key
+            if col not in out.columns:
+                if key == "variable" and "variable_id" in out.columns:
+                    col = "variable_id"
+                elif key == "variable_id" and "variable" in out.columns:
+                    col = "variable"
+                else:
+                    continue
+            values = _parse_facet_values(raw)
+            if values:
+                out = out[out[col].astype(str).isin(values)]
+        return out
+
     def _generate_subsearches(self) -> list[dict]:
         """
         Break down search criteria into individual subsearches.
@@ -306,6 +364,21 @@ class SearchResults:
         base = self.clean_and_join_dict_vals(subsearch_criteria)
         return f"{base}_file" if self._file_search else f"{base}_dataset"
     
+    def _read_cache_csv(self, cache_file: Path) -> Optional[pd.DataFrame]:
+        """Read a cache CSV; empty file means cached negative search."""
+        try:
+            if cache_file.stat().st_size == 0:
+                return pd.DataFrame()
+            df = pd.read_csv(cache_file)
+            if "_sa_instance_state" in df.columns:
+                df = df.drop(columns=["_sa_instance_state"])
+            return df
+        except pd.errors.EmptyDataError:
+            return pd.DataFrame()
+        except Exception as e:
+            log.warning(f"Could not load cache file {cache_file}: {e}")
+            return None
+
     def _load_subsearch_from_cache(self, subsearch_criteria: dict) -> Optional[pd.DataFrame]:
         """
         Load a specific subsearch from cache if available.
@@ -314,25 +387,38 @@ class SearchResults:
         """
         cache_key = self._get_subsearch_cache_key(subsearch_criteria)
         cache_file = self.search_results_dir / f"{cache_key}.csv"
-        
+
         if cache_file.exists():
-            try:
-                # Check if file is empty (negative search marker)
-                if cache_file.stat().st_size == 0:
-                    # Empty file indicates a cached negative search
-                    return pd.DataFrame()
-                
-                df = pd.read_csv(cache_file)
-                if "_sa_instance_state" in df.columns:
-                    df = df.drop(columns=["_sa_instance_state"])
-                # Return DataFrame even if empty (indicates cached negative search)
-                return df
-            except pd.errors.EmptyDataError:
-                # Empty CSV file - this is a cached negative search
-                return pd.DataFrame()
-            except Exception as e:
-                log.warning(f"Could not load cache file {cache_file}: {e}")
-                return None
+            return self._read_cache_csv(cache_file)
+
+        # Fallback: reuse broad cached search and filter by restricting facets
+        has_restrictions = any(
+            subsearch_criteria.get(facet) for facet in _RESTRICTING_FACETS
+        )
+        if has_restrictions:
+            broad_criteria = {
+                k: v
+                for k, v in subsearch_criteria.items()
+                if k not in _RESTRICTING_FACETS
+            }
+            broad_file = (
+                self.search_results_dir
+                / f"{self._get_subsearch_cache_key(broad_criteria)}.csv"
+            )
+            if broad_file.exists():
+                broad_df = self._read_cache_csv(broad_file)
+                if broad_df is not None:
+                    if broad_df.empty:
+                        return broad_df
+                    filtered = self._apply_facet_filters(broad_df, subsearch_criteria)
+                    log.debug(
+                        "Loaded broad cache %s, filtered to %s rows for %s",
+                        broad_file.name,
+                        len(filtered),
+                        cache_key,
+                    )
+                    return filtered
+
         return None
     
     def _save_subsearch_to_cache(self, subsearch_criteria: dict, results_df: pd.DataFrame) -> None:
@@ -489,9 +575,12 @@ class SearchResults:
         for subsearch in subsearches:
             cached_df = self._load_subsearch_from_cache(subsearch)
             if cached_df is not None:   # if cached result found (even if empty - indicates negative search was cached)
-                # Cached result found (even if empty - indicates negative search was cached)
                 if not cached_df.empty:
-                    cached_results.append(cached_df)
+                    # Broad-cache fallback is pre-filtered; narrow cache is not.
+                    if (self.search_results_dir / f"{self._get_subsearch_cache_key(subsearch)}.csv").exists():
+                        cached_df = self._apply_facet_filters(cached_df, subsearch)
+                    if not cached_df.empty:
+                        cached_results.append(cached_df)
                     log.debug(f"Loaded from cache ({len(cached_df)} results): {self._get_subsearch_cache_key(subsearch)}")
                 else:
                     log.debug(f"Loaded negative search from cache (no results): {self._get_subsearch_cache_key(subsearch)}")
@@ -580,7 +669,11 @@ class SearchResults:
                         
                         # Only add non-empty results to cached_results
                         if not subsearch_df.empty:
-                            cached_results.append(subsearch_df)
+                            subsearch_df = self._apply_facet_filters(
+                                subsearch_df, subsearch
+                            )
+                            if not subsearch_df.empty:
+                                cached_results.append(subsearch_df)
                     except Exception as e:
                         log.error(f"Error creating DataFrame or saving to cache: {e}")
                         import traceback
