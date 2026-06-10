@@ -22,6 +22,7 @@ def test_find_alternative_files_prefers_other_data_nodes(monkeypatch):
 
     api = DummyAPI()
 
+    replica_filename = "tas_Amon_model_historical_r1i1p1f1_gn_200001-200012.nc"
     failed_file = {
         "file_id": "orig-file",
         "dataset_id": "ds1",
@@ -31,11 +32,11 @@ def test_find_alternative_files_prefers_other_data_nodes(monkeypatch):
         "data_node": "esgf.ichec.ie",
         "version": "v20200101",
         "nominal_resolution": "100 km",
-        "filename": "tas_Amon_model_historical_r1i1p1f1_gn_200001-200012.nc",
+        "filename": replica_filename,
     }
 
-    # Two candidates: one on same node, one on a different node,
-    # otherwise identical. The different-node file should be ranked first.
+    # Replicas share the same filename on different data nodes.
+    # The different-node replica should be ranked first.
     candidates = [
         {
             "file_id": "alt-same-node",
@@ -46,7 +47,7 @@ def test_find_alternative_files_prefers_other_data_nodes(monkeypatch):
             "data_node": "esgf.ichec.ie",
             "version": "v20200101",
             "nominal_resolution": "100 km",
-            "filename": "tas_Amon_model_historical_r2i1p1f1_gn_200001-200012.nc",
+            "filename": replica_filename,
         },
         {
             "file_id": "alt-other-node",
@@ -57,12 +58,13 @@ def test_find_alternative_files_prefers_other_data_nodes(monkeypatch):
             "data_node": "esgf-data.dkrz.de",
             "version": "v20200101",
             "nominal_resolution": "100 km",
-            "filename": "tas_Amon_model_historical_r3i1p1f1_gn_200001-200012.nc",
+            "filename": replica_filename,
         },
     ]
 
-    def fake_search(criteria):
+    def fake_search(criteria, file=False):
         # Sanity-check that expected facets are used
+        assert file is True
         assert criteria["variable"] == "tas"
         assert criteria["experiment_id"] == "historical"
         assert criteria["frequency"] == "mon"
@@ -90,7 +92,7 @@ def test_find_alternative_files_filters_original_dataset(monkeypatch):
         "data_node": "esgf.ichec.ie",
     }
 
-    def fake_search(criteria):
+    def fake_search(criteria, file=False):
         return [
             {
                 "file_id": "file-1",  # same file_id, must be excluded

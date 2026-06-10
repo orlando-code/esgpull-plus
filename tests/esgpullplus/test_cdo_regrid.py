@@ -7,15 +7,21 @@ import numpy as np
 from esgpull.esgpullplus import cdo_regrid as cr
 
 
-def test_regrid_operators_use_bilinear_without_corners():
-    pipeline = cr.CDORegridPipeline(verbose=False)
+def _pipeline_without_cdo(monkeypatch) -> cr.CDORegridPipeline:
+    """Construct a pipeline without invoking the CDO binary."""
+    monkeypatch.setattr(cr.CDORegridPipeline, "_setup_cdo", lambda self: None)
+    return cr.CDORegridPipeline(verbose=False)
+
+
+def test_regrid_operators_use_bilinear_without_corners(monkeypatch):
+    pipeline = _pipeline_without_cdo(monkeypatch)
     assert pipeline._regrid_operators("curvilinear", False) == ("remapbil", "genbil")
     assert pipeline._regrid_operators("curvilinear", True) == ("remapcon", "gencon")
     assert pipeline._regrid_operators("structured", False) == ("remapcon", "gencon")
 
 
-def test_has_grid_corners_detects_cf_bounds():
-    pipeline = cr.CDORegridPipeline(verbose=False)
+def test_has_grid_corners_detects_cf_bounds(monkeypatch):
+    pipeline = _pipeline_without_cdo(monkeypatch)
     ds = xa.Dataset(
         coords={
             "lat": ("lat", [0.0, 1.0]),
