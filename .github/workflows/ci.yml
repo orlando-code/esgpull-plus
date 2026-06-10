@@ -43,5 +43,8 @@ jobs:
       - name: Sync dependencies
         run: rye sync
 
+      - name: Install CDO binary
+        run: sudo apt-get update && sudo apt-get install -y cdo
+
       - name: Run tests
         run: rye test
