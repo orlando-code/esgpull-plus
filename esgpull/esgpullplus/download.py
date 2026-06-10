@@ -1,4 +1,6 @@
 # general
+import logging
+import re
 import threading
 import time
 from pathlib import Path
@@ -18,6 +20,13 @@ from esgpull.esgpullplus.enhanced_file import EnhancedFile
 from esgpull import utils
 # parallel
 import concurrent.futures
+
+
+_NETWORK_ERRORS = (
+    requests.exceptions.Timeout,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.ChunkedEncodingError,
+)
 
 
 class DownloadSubset:
@@ -45,6 +54,7 @@ class DownloadSubset:
         self.find_alternatives = find_alternatives
         self.api_instance = api_instance
         self._shutdown_requested = threading.Event()
+        self._last_download_error: str | None = None
 
     def _get_file_path(self, file):
         """Get the path to the file on the file system.
@@ -61,6 +71,79 @@ class DownloadSubset:
             return self.data_dir / file.local_path / file.filename
         return self.fs.paths.data / file.local_path / file.filename
 
+    def _data_root(self) -> Path | None:
+        if self.data_dir:
+            return Path(self.data_dir)
+        if self.fs:
+            return Path(self.fs.paths.data)
+        return None
+
+    def _find_existing_path(self, file: EnhancedFile) -> Path | None:
+        """Locate an on-disk copy, ignoring dataset version in local_path when needed."""
+        filename = getattr(file, "filename", "") or ""
+        if not filename:
+            return None
+
+        file_path = self._get_file_path(file)
+        if file_path.is_file() and file_path.stat().st_size > 0:
+            return file_path
+
+        base_dir = self._data_root()
+        local_path = getattr(file, "local_path", None)
+        if not base_dir or not local_path:
+            return None
+
+        local = Path(str(local_path))
+        if local.parts and re.match(r"^v\d", local.parts[-1], re.I):
+            version_parent = base_dir / local.parent
+            if version_parent.is_dir():
+                for version_dir in sorted(version_parent.iterdir(), reverse=True):
+                    if not version_dir.is_dir() or not re.match(r"^v\d", version_dir.name, re.I):
+                        continue
+                    candidate = version_dir / filename
+                    if candidate.is_file() and candidate.stat().st_size > 0:
+                        return candidate
+
+        if len(local.parts) >= 4:
+            model_root = base_dir / Path(*local.parts[:4])
+            if model_root.is_dir():
+                for candidate in model_root.rglob(filename):
+                    if candidate.is_file() and candidate.stat().st_size > 0:
+                        return candidate
+
+        return None
+
+    def _variant_coverage_exists(self, file: EnhancedFile) -> Path | None:
+        """Return an on-disk path if the file or an accepted variant already exists."""
+        existing = self._find_existing_path(file)
+        if existing:
+            return existing
+
+        filename = getattr(file, "filename", "") or ""
+        match = re.search(r"_(EC-Earth3)_historical_.*_(\d{6}-\d{6})\.nc$", filename)
+        if not match:
+            return None
+
+        period = match.group(2)
+        variable = filename.split("_", 1)[0]
+        base_dir = self._data_root()
+        if not base_dir:
+            return None
+
+        inst_root = base_dir / "CMIP6" / "CMIP" / "EC-Earth-Consortium"
+        if not inst_root.is_dir():
+            return None
+
+        for candidate in inst_root.rglob(f"{variable}_*EC-Earth3-HR*_{period}.nc"):
+            if (
+                candidate.is_file()
+                and candidate.stat().st_size > 0
+                and "_regridded" not in candidate.stem
+            ):
+                return candidate
+
+        return None
+
     def _file_exists(self, file: EnhancedFile) -> bool:
         """Check if the file exists on the file system.
         
@@ -74,8 +157,7 @@ class DownloadSubset:
         filename = getattr(file, "filename", "") or (file.get("filename", "") if isinstance(file, dict) else "")
         if not (filename and str(filename).strip()):
             return False  # Can't download without a filename
-        file_path = self._get_file_path(file)
-        exists = file_path.is_file() and file_path.stat().st_size > 0
+        exists = self._variant_coverage_exists(file) is not None
         if not exists:
             self._remove_part_file_detritus(file) # remove any leftover .part files before attempting to download
         return exists
@@ -129,6 +211,35 @@ class DownloadSubset:
         console.print(f"Processing time: {fileops.format_processing_time(processing_time)}")
     
 
+    def _log_download_error(self, file: EnhancedFile, error_msg: str) -> None:
+        ui.init_download_error_log()
+        logger = logging.getLogger("esgpull.download_errors")
+        logger.error(
+            "%s | node=%s | %s",
+            file.filename,
+            getattr(file, "data_node", "Unknown"),
+            error_msg,
+        )
+        for handler in logger.handlers:
+            handler.flush()
+
+    def _finalize_failed_download(
+        self,
+        file: EnhancedFile,
+        ui_instance: ui.DownloadProgressUI,
+        error_msg: str,
+        status: str = "FAILED",
+        original_error: Exception | None = None,
+    ) -> None:
+        if self.find_alternatives and self.api_instance:
+            if self._try_alternative_file(file, ui_instance, original_error):
+                return
+
+        ui_instance.set_status(file, status, "red")
+        ui_instance.add_failed(file, error_msg, exc_info=original_error is not None)
+        ui_instance.complete_file(file)
+        self.hide_file_after_delay(file, ui_instance, 5)
+
     def _process_file_with_ui(self, file: EnhancedFile, ui_instance: ui.DownloadProgressUI) -> None:
         """Process a file with the downloading progress UI.
         
@@ -140,53 +251,39 @@ class DownloadSubset:
             ui_instance.set_status(file, "STARTING", "cyan")
             try:
                 success = self._download_file_direct_ui(file, ui_instance)
-            except _SkipFileError as e:
+            except _SkipFileError:
                 ui_instance.set_status(file, "SKIPPED", "yellow")
                 ui_instance.complete_file(file)
                 return
             if success:
                 ui_instance.set_status(file, "DONE", "green")
                 ui_instance.complete_file(file)
-                # Hide the file's progress bar after 5 seconds
                 self.hide_file_after_delay(file, ui_instance, 5)
             else:
-                # Check if we should try alternatives for timeout errors
-                if self.find_alternatives and self.api_instance:
-                    if self._try_alternative_file(file, ui_instance):
-                        return  # Successfully downloaded alternative
-                
-                ui_instance.set_status(file, "FAILED", "red")
-                ui_instance.complete_file(file)
-        except requests.exceptions.Timeout as timeout_error:
-            # Handle timeout exception specifically
-            if self.find_alternatives and self.api_instance:
-                if self._try_alternative_file(file, ui_instance, timeout_error):
-                    return  # Successfully downloaded alternative
-            
-            import traceback
-            error_msg = f"Download timeout for {file.filename}: {timeout_error}"
-            print(f"\n[ERROR] {error_msg}")
-            print(f"[ERROR] URL: {file.url}")
-            print(f"[ERROR] File size: {file.size}")
-            print(f"[ERROR] Data node: {getattr(file, 'data_node', 'Unknown')}")
-            print("-" * 80)
-            ui_instance.set_status(file, "TIMEOUT", "red")
-            ui_instance.add_failed(file, f"Timeout: {timeout_error}", timeout_error)
-            ui_instance.complete_file(file)
-            self.hide_file_after_delay(file, ui_instance, 5)
+                detail = self._last_download_error or "unknown error"
+                self._finalize_failed_download(
+                    file,
+                    ui_instance,
+                    f"Download failed after retries: {file.filename} ({detail})",
+                )
+        except _NETWORK_ERRORS as network_error:
+            status = "TIMEOUT" if isinstance(network_error, requests.exceptions.Timeout) else "ERROR"
+            self._finalize_failed_download(
+                file,
+                ui_instance,
+                f"{type(network_error).__name__}: {network_error}",
+                status=status,
+                original_error=network_error,
+            )
         except Exception as e:
-            import traceback
             error_msg = f"Processing failed for {file.filename}: {e}"
-            print(f"\n[ERROR] {error_msg}")
-            print(f"[ERROR] Full traceback:")
-            traceback.print_exc()
-            print(f"[ERROR] URL: {file.url}")
-            print(f"[ERROR] File size: {file.size}")
-            print(f"[ERROR] Data node: {getattr(file, 'data_node', 'Unknown')}")
-            print("-" * 80)
-            ui_instance.set_status(file, "ERROR", "red")
-            ui_instance.add_failed(file, f"Error: {e}", e)
-            ui_instance.complete_file(file)
+            self._finalize_failed_download(
+                file,
+                ui_instance,
+                error_msg,
+                status="ERROR",
+                original_error=e,
+            )
     
     def _try_alternative_file(
         self,
@@ -249,10 +346,11 @@ class DownloadSubset:
             # Try each alternative until one succeeds
             for alt_file_dict in alternatives:
                 try:
-                    rich_print(
-                        f"[blue]🔄 Trying alternative file: {alt_file_dict.get('filename', 'unknown')} "
-                        f"from {alt_file_dict.get('data_node', 'unknown node')}[/blue]"
-                    )
+                    if self.verbose:
+                        rich_print(
+                            f"[blue]Trying alternative: {alt_file_dict.get('filename', 'unknown')} "
+                            f"from {alt_file_dict.get('data_node', 'unknown node')}[/blue]"
+                        )
                     
                     # Convert dict back to EnhancedFile
                     from esgpull.esgpullplus.enhanced_file import EnhancedFile
@@ -269,10 +367,11 @@ class DownloadSubset:
                     alt_success = self._download_file_direct_ui(alt_file, ui_instance)
                     
                     if alt_success:
-                        rich_print(
-                            f"[green]✅ Successfully downloaded alternative file: "
-                            f"{alt_file.filename} from {alt_file.data_node}[/green]"
-                        )
+                        if self.verbose:
+                            rich_print(
+                                f"[green]Downloaded alternative: {alt_file.filename} "
+                                f"from {alt_file.data_node}[/green]"
+                            )
                         # Update the original file's status to show it was replaced
                         ui_instance.set_status(
                             failed_file,
@@ -282,23 +381,23 @@ class DownloadSubset:
                         ui_instance.complete_file(failed_file)
                         return True
                     else:
-                        rich_print(
-                            f"[yellow]⚠️  Alternative file {alt_file.filename} also failed[/yellow]"
-                        )
+                        if self.verbose:
+                            rich_print(f"[yellow]Alternative failed: {alt_file.filename}[/yellow]")
                         continue
                         
                 except Exception as alt_error:
-                    rich_print(
-                        f"[yellow]⚠️  Error trying alternative {alt_file_dict.get('filename', 'unknown')}: {alt_error}[/yellow]"
-                    )
+                    if self.verbose:
+                        rich_print(
+                            f"[yellow]Alternative error ({alt_file_dict.get('filename', 'unknown')}): "
+                            f"{alt_error}[/yellow]"
+                        )
                     continue
             
             return False
             
         except Exception as e:
-            rich_print(
-                f"[yellow]⚠️  Error in alternative file search: {e}[/yellow]"
-            )
+            if self.verbose:
+                rich_print(f"[yellow]Alternative search error: {e}[/yellow]")
             return False
 
     def _is_direct_download_needed(self) -> bool:
@@ -335,15 +434,7 @@ class DownloadSubset:
             ui_instance.set_status(file, "SAVING", "yellow")
             return self._save_dataset(file, ds)
         except Exception as e:
-            import traceback
-            error_msg = f"xarray download failed for {file.filename}: {e}"
-            print(f"\n[ERROR] {error_msg}")
-            print(f"[ERROR] Full traceback:")
-            traceback.print_exc()
-            print(f"[ERROR] URL: {file.url}")
-            print(f"[ERROR] File size: {file.size}")
-            print(f"[ERROR] Data node: {getattr(file, 'data_node', 'Unknown')}")
-            print("-" * 80)
+            self._last_download_error = f"xarray download failed: {e}"
             return False
 
     def _test_url(self, url: str) -> bool:
@@ -397,6 +488,8 @@ class DownloadSubset:
                 if self.verbose:
                     print(f"[yellow]Resuming download of {file.filename} from position {resume_position:,} bytes[/yellow]")
         
+        self._last_download_error = None
+
         # Attempt download with retries
         for attempt in range(max_retries + 1):
             try:
@@ -472,7 +565,9 @@ class DownloadSubset:
                             time.sleep(2 ** attempt)  # Exponential backoff
                             continue
                         else:
-                            print(f"[ERROR] Download incomplete after {max_retries + 1} attempts")
+                            self._last_download_error = (
+                                f"incomplete download ({final_size:,} of {total:,} bytes)"
+                            )
                             return False
                     
                     # Rename to final file
@@ -482,10 +577,10 @@ class DownloadSubset:
                             print(f"[DEBUG] Successfully downloaded {file.filename} ({file_path.stat().st_size:,} bytes)") 
                         return True
                     else:
-                        print(f"[ERROR] Downloaded file {file.filename} is empty or missing after rename")
+                        self._last_download_error = "downloaded file empty or missing after rename"
                         return False
                 else:
-                    print(f"[ERROR] Downloaded file {file.filename} is empty or missing")
+                    self._last_download_error = "downloaded file empty or missing"
                     return False
                     
             except (requests.exceptions.ChunkedEncodingError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
@@ -509,29 +604,7 @@ class DownloadSubset:
                     raise
                     
             except Exception as e:
-                import traceback
-                error_msg = f"Direct download failed for {file.filename}: {e}"
-                print(f"\n[ERROR] {error_msg}")
-                print(f"[ERROR] Full traceback:")
-                traceback.print_exc()
-                print(f"[ERROR] URL: {file.url}")
-                print(f"[ERROR] File size: {file.size}")
-                print(f"[ERROR] Data node: {getattr(file, 'data_node', 'Unknown')}")
-                
-                # Additional debugging for common issues
-                if "timeout" in str(e).lower():
-                    print(f"[ERROR] This appears to be a timeout issue. Try increasing timeout or check network connection.")
-                elif "connection" in str(e).lower() or "chunkedencoding" in str(e).lower():
-                    print(f"[ERROR] This appears to be a connection issue. Partial file may be saved for resume.")
-                elif "404" in str(e).lower() or "not found" in str(e).lower():
-                    print(f"[ERROR] File not found. The URL may be incorrect or the file may have been moved.")
-                elif "403" in str(e).lower() or "forbidden" in str(e).lower():
-                    print(f"[ERROR] Access forbidden. You may need authentication or the file may be restricted.")
-                elif "ssl" in str(e).lower() or "certificate" in str(e).lower():
-                    print(f"[ERROR] SSL/Certificate issue. Try updating certificates or using a different data node.")
-                
-                print("-" * 80)
-                
+                self._last_download_error = str(e)
                 # Only delete partial file if it's a non-resumable error (404, 403, etc.)
                 if "404" in str(e).lower() or "403" in str(e).lower() or "not found" in str(e).lower():
                     for path in [temp_path, file_path]:
@@ -544,12 +617,11 @@ class DownloadSubset:
                 
                 if attempt >= max_retries:
                     return False
-                else:
-                    # Continue to retry
-                    time.sleep(2 ** attempt)
-                    continue
+                time.sleep(2 ** attempt)
+                continue
         
         # All retries exhausted
+        self._last_download_error = self._last_download_error or "all retries exhausted"
         return False
 
     def _open_dataset_simple(self, file: EnhancedFile) -> xa.Dataset | None:
@@ -619,15 +691,7 @@ class DownloadSubset:
                 return True
 
         except Exception as e:
-            import traceback
-            error_msg = f"Save failed for {file.filename}: {e}"
-            print(f"\n[ERROR] {error_msg}")
-            print(f"[ERROR] Full traceback:")
-            traceback.print_exc()
-            print(f"[ERROR] URL: {file.url}")
-            print(f"[ERROR] File size: {file.size}")
-            print(f"[ERROR] Data node: {getattr(file, 'data_node', 'Unknown')}")
-            print("-" * 80)
+            self._last_download_error = f"Save failed: {e}"
             # Cleanup
             for path in [temp_path, file_path]:
                 if path.exists():
