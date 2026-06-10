@@ -658,7 +658,7 @@ class CMIP6DataLoader:
         """
         files = self.catalog.get_files(
             experiment=experiment,
-            is_regridded=self.prefer_regridded,
+            is_regridded=self.regridded_only,
         )
         
         return {
