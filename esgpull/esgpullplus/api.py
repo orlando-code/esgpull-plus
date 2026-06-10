@@ -276,6 +276,66 @@ class EsgpullAPI:
             "This may be a temporary ESGF infrastructure issue."
         )
     
+    def _alternatives_from_search_cache(
+        self,
+        failed_file: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Find replica files for the same filename in cached search CSVs."""
+        filename = failed_file.get("filename")
+        if not filename:
+            return []
+
+        cache_dirs: list[Path] = []
+        try:
+            criteria = fileops.read_yaml(fileops.get_repo_root() / "search.yaml")
+            data_dir = criteria.get("meta_criteria", {}).get("data_dir")
+            if data_dir:
+                cache_dirs.append(Path(data_dir) / "search_results")
+        except Exception:
+            pass
+
+        failed_url = failed_file.get("url", "")
+        failed_data_node = failed_file.get("data_node", "")
+        alternatives: list[tuple[int, dict]] = []
+
+        for cache_dir in cache_dirs:
+            if not cache_dir.is_dir():
+                continue
+            for csv_path in cache_dir.glob("*_file.csv"):
+                try:
+                    import pandas as pd
+
+                    df = pd.read_csv(csv_path, low_memory=False)
+                except Exception:
+                    continue
+                if "filename" not in df.columns:
+                    continue
+                matches = df[df["filename"] == filename]
+                for _, row in matches.iterrows():
+                    alt = row.to_dict()
+                    if alt.get("url") == failed_url:
+                        continue
+                    if (
+                        alt.get("file_id") == failed_file.get("file_id")
+                        and alt.get("data_node") == failed_data_node
+                    ):
+                        continue
+                    score = 10000 if alt.get("data_node") != failed_data_node else 0
+                    alternatives.append((score, alt))
+
+        alternatives.sort(key=lambda item: item[0], reverse=True)
+        seen_urls: set[str] = set()
+        result: list[dict] = []
+        for _, alt in alternatives:
+            url = alt.get("url", "")
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            result.append(alt)
+            if len(result) >= 5:
+                break
+        return result
+
     def find_alternative_files(
         self,
         failed_file: Dict[str, Any],
@@ -310,33 +370,42 @@ class EsgpullAPI:
             # Can't search without variable
             return []
         
-        rich_print(
-            f"[cyan]🔍 Searching for alternative files for {failed_file.get('filename', 'unknown file')}...[/cyan]"
-        )
+        cached = self._alternatives_from_search_cache(failed_file)
+        if cached:
+            return cached
+
+        for key in ("source_id", "table_id", "member_id", "grid_label"):
+            value = failed_file.get(key)
+            if value:
+                search_criteria[key] = value
         
         try:
-            alternatives = self.search(search_criteria)
+            alternatives = self.search(search_criteria, file=True)
             
             # Filter alternatives
             filtered_alternatives = []
-            failed_dataset_id = failed_file.get("dataset_id", "")
-            failed_instance_id = failed_file.get("instance_id", "")
             failed_file_id = failed_file.get("file_id", "")
+            failed_filename = failed_file.get("filename", "")
+            failed_url = failed_file.get("url", "")
+            failed_data_node = failed_file.get("data_node", "")
             
             for alt in alternatives:
                 alt_file_id = alt.get("file_id", "")
-                alt_dataset_id = alt.get("dataset_id", "")
-                
-                # Skip the original file and excluded files
-                if (alt_file_id == failed_file_id or 
-                    alt_file_id in exclude_file_ids or
-                    alt_dataset_id == failed_dataset_id):
-                    continue
-                
-                # Prefer files from different data nodes
-                failed_data_node = failed_file.get("data_node", "")
                 alt_data_node = alt.get("data_node", "")
-                
+
+                if alt_file_id in exclude_file_ids:
+                    continue
+
+                # Skip the exact replica that failed; allow same file_id on other nodes.
+                if alt.get("url") == failed_url:
+                    continue
+                if alt_file_id == failed_file_id and alt_data_node == failed_data_node:
+                    continue
+
+                # Replicas share filename but live on different data nodes.
+                if alt.get("filename") != failed_filename:
+                    continue
+
                 # Match key characteristics
                 if (alt.get("variable") == failed_file.get("variable") and
                     alt.get("experiment_id") == failed_file.get("experiment_id") and
@@ -385,21 +454,9 @@ class EsgpullAPI:
             filtered_alternatives.sort(key=lambda x: x[0], reverse=True)
             result = [alt for _, alt in filtered_alternatives[:5]]  # Return top 5
             
-            if result:
-                rich_print(
-                    f"[green]✅ Found {len(result)} alternative file(s) for {failed_file.get('filename', 'unknown')}[/green]"
-                )
-            else:
-                rich_print(
-                    f"[yellow]⚠️  No alternative files found for {failed_file.get('filename', 'unknown')}[/yellow]"
-                )
-            
             return result
             
-        except Exception as e:
-            rich_print(
-                f"[yellow]⚠️  Error searching for alternatives: {e}[/yellow]"
-            )
+        except Exception:
             return []
 
 
@@ -689,6 +746,40 @@ def _file_in_year_range(
     return True
 
 
+def resolve_download_output_dir(
+    meta_criteria: dict,
+    repo_root: Path | None = None,
+) -> Path | None:
+    """Resolve flat download output directory from meta_criteria.
+
+    When test=True (default), files are written flat under repo_root/test_downloads/.
+    When test=False, returns output_dir if set; otherwise None and downloads use
+    data_dir with the CMIP6 local_path layout.
+    """
+    if meta_criteria.get("test", True):
+        root = repo_root or fileops.get_repo_root()
+        return root / "test_downloads"
+    output_dir = meta_criteria.get("output_dir")
+    return Path(output_dir) if output_dir else None
+
+
+def resolve_download_base_dir(
+    meta_criteria: dict,
+    repo_root: Path | None = None,
+    default_data_dir: Path | None = None,
+) -> Path:
+    """Base directory for download cleanup (e.g. removing .part files)."""
+    output_dir = resolve_download_output_dir(meta_criteria, repo_root)
+    if output_dir is not None:
+        return output_dir
+    data_dir = meta_criteria.get("data_dir")
+    if data_dir:
+        return Path(data_dir)
+    if default_data_dir is not None:
+        return default_data_dir
+    return fileops.get_repo_root() / "test_downloads"
+
+
 def search_and_download(search_criteria, meta_criteria, API=None, symmetrical=False, symmetrical_sources_cache=None):
     """
     Perform a search and download files based on the provided criteria.
@@ -715,13 +806,8 @@ def search_and_download(search_criteria, meta_criteria, API=None, symmetrical=Fa
         file=True,
     )
     
-    # Check system resources before starting
-    if meta_criteria.get("test", True):
-        # output_dir = meta_criteria.get("output_dir", None)
-        output_dir = "test_downloads"
-    else:
-        output_dir = meta_criteria.get("output_dir", None)
-    if output_dir:
+    output_dir = resolve_download_output_dir(meta_criteria)
+    if output_dir is not None:
         search_results.check_system_resources(output_dir)
     
     files = search_results.run()
@@ -1046,14 +1132,21 @@ def run(symmetrical: bool = False):
 
             REPO_ROOT = fileops.get_repo_root()
             print("REPO ROOT:", REPO_ROOT)
+            from esgpull.esgpullplus import ui as download_ui
+
+            error_log_path = download_ui.init_download_error_log()
+            rich_print(f"[dim]Download errors log: {error_log_path}[/dim]")
             CRITERIA_DICT = fileops.read_yaml(REPO_ROOT / "search.yaml")
             SEARCH_CRITERIA_CONFIG = CRITERIA_DICT.get("search_criteria", {})
             META_CRITERIA_CONFIG = CRITERIA_DICT.get("meta_criteria", {})
             API = EsgpullAPI()
 
-            # remove any existing .part files in the main directory to avoid conflicts
-            data_dir = META_CRITERIA_CONFIG.get("data_dir")
-            main_dir = Path(data_dir) if data_dir else API.esg.fs.paths.data
+            # remove any existing .part files in the download directory to avoid conflicts
+            main_dir = resolve_download_base_dir(
+                META_CRITERIA_CONFIG,
+                repo_root=REPO_ROOT,
+                default_data_dir=API.esg.fs.paths.data,
+            )
             remove_part_files(main_dir)
 
             # Convert comma-separated strings to lists for iteration
@@ -1214,6 +1307,7 @@ def run(symmetrical: bool = False):
                         input_dir=regrid_input,
                         include_subdirectories=True,
                         target_resolution=target_res,
+                        variables=META_CRITERIA_CONFIG.get("regrid_variables"),
                         max_workers=META_CRITERIA_CONFIG.get("max_workers", 4),
                     )
                 except KeyboardInterrupt:
