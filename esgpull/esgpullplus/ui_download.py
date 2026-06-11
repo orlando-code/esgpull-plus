@@ -15,10 +15,6 @@ from typing import Optional
 # custom
 from esgpull.esgpullplus import config
 
-# TODO: remove FAILED files from UI after 10s (like with successful files)
-# TODO: fix incorrectly marked failed files
-# TODO: fix files mislabelled as cancelled in final summary
-
 _DOWNLOAD_ERROR_LOGGER_NAME = "esgpull.download_errors"
 _download_error_log_path: Optional[Path] = None
 

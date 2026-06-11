@@ -11,7 +11,6 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, List, Any
-from concurrent.futures import Future
 
 from rich.progress import (
     Progress,
@@ -26,9 +25,6 @@ from rich.progress import (
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
-from rich.live import Live
-from rich.layout import Layout
-from rich.text import Text
 
 from esgpull.esgpullplus import config
 
@@ -433,16 +429,11 @@ class BatchRegridUI:
 
     def _update_stats(self, new_stats: Dict[str, Any]):
         """Update cumulative statistics."""
-        # print("here3")
-        # print(new_stats)
         for key, value in new_stats.items():
             if key in self.stats:
                 if isinstance(value, (int, float)):
                     self.stats[key] += value
                 else:
-                    # print("here4")
-                    # print(key)
-                    # print(value)
                     self.stats[key] = value
             else:
                 self.stats[key] = value # add new key to stats dictionary

@@ -12,8 +12,9 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-import numpy as np
 import pandas as pd
+import numpy as np
+from matplotlib.colors import LogNorm
 
 from esgpull.esgpullplus import utils
 
@@ -370,8 +371,7 @@ def visualize_source_availability(
     _save(fig, "ensemble_counts")
 
     # 3. Resolution distribution as a heatmap (block table) by source and resolution ---
-    import numpy as np
-    from matplotlib.colors import LogNorm
+
     # order by ascending smallest resolution first
     analysis_df = analysis_df.sort_values(by="resolutions", ascending=True)
     all_res = set()

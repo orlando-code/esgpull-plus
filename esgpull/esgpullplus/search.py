@@ -1,22 +1,22 @@
 # general
 import logging
 import os
-import re
 from pathlib import Path
 from typing import Optional
 
-import numpy as np
 import pandas as pd
 from rich.console import Console
 from rich.panel import Panel
 import httpx
+import traceback
 
 # rich
 from rich.table import Table
 
 # custom
-from esgpull.esgpullplus import api, fileops, config, utils
+from esgpull.esgpullplus import api, fileops, config, utils, search_analysis
 from esgpull.esgpullplus.enhanced_file import EnhancedFile
+
 
 log = logging.getLogger(__name__)
 
@@ -453,7 +453,6 @@ class SearchResults:
             log.warning(f"Could not save to cache (continuing without cache): {e}")
         except Exception as e:
             log.error(f"Error saving to cache: {e}")
-            import traceback
             traceback.print_exc()
 
     def check_system_resources(self, output_dir=None):
@@ -676,13 +675,11 @@ class SearchResults:
                                 cached_results.append(subsearch_df)
                     except Exception as e:
                         log.error(f"Error creating DataFrame or saving to cache: {e}")
-                        import traceback
                         traceback.print_exc()
                         continue
                     
                 except Exception as e:
                     log.warning(f"Failed to process subsearch {self._get_subsearch_cache_key(subsearch)}: {e}")
-                    import traceback
                     traceback.print_exc()
                     continue
         
@@ -749,12 +746,10 @@ class SearchResults:
 
     def get_experiments_by_source(self, variable: Optional[str] = None) -> pd.DataFrame:
         """Delegate to :mod:`search_analysis`. See :func:`search_analysis.get_experiments_by_source`."""
-        from esgpull.esgpullplus import search_analysis
         return search_analysis.get_experiments_by_source(self.results_df, variable=variable)
 
     def summarize_symmetrical_datasets(self) -> pd.DataFrame:
         """Delegate to :mod:`search_analysis`. See :func:`search_analysis.summarize_symmetrical_datasets`."""
-        from esgpull.esgpullplus import search_analysis
         return search_analysis.summarize_symmetrical_datasets(self.results_df)
 
     def analyze_source_availability(
@@ -764,7 +759,6 @@ class SearchResults:
         require_both: bool = True,
     ) -> pd.DataFrame:
         """Delegate to :mod:`search_analysis`. See :func:`search_analysis.analyze_source_availability`."""
-        from esgpull.esgpullplus import search_analysis
         return search_analysis.analyze_source_availability(
             self.results_df,
             historical_experiment=historical_experiment,
@@ -774,7 +768,6 @@ class SearchResults:
 
     def visualize_source_availability(self, analysis_df=None, **kwargs) -> dict:
         """Delegate to :mod:`search_analysis`. See :func:`search_analysis.visualize_source_availability`."""
-        from esgpull.esgpullplus import search_analysis
         if analysis_df is None:
             analysis_df = self.analyze_source_availability(**{
                 k: v for k, v in kwargs.items()
@@ -787,5 +780,4 @@ class SearchResults:
 
     def analyze_and_visualize_sources(self, **kwargs) -> tuple[pd.DataFrame, dict]:
         """Delegate to :mod:`search_analysis`. See :func:`search_analysis.analyze_and_visualize`."""
-        from esgpull.esgpullplus import search_analysis
         return search_analysis.analyze_and_visualize(self.results_df, **kwargs)

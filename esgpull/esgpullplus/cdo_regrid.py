@@ -35,13 +35,11 @@ import time
 import xarray as xa
 from cdo import Cdo
 from rich.console import Console
-# from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn, TimeRemainingColumn    # TODO: make a nice processing UI
-# from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 
 from esgpull.esgpullplus import utils, fileops, config
-from esgpull.esgpullplus.regrid_ui import RegridProgressUI, BatchRegridUI
+from esgpull.esgpullplus.ui_regrid import RegridProgressUI, BatchRegridUI
 
 _REGRID_ERROR_LOGGER_NAME = "esgpull.regrid_errors"
 _regrid_error_log_path: Optional[Path] = None
