@@ -196,7 +196,7 @@ class DownloadSubset:
             f"Downloading {len(files_to_download)} new {dl_str} [APPROX TOTAL: {utils.format_size(total_size)}]..."
         )
 
-        with ui.DownloadProgressUI(files_to_download) as ui_instance:
+        with ui_download.DownloadProgressUI(files_to_download) as ui_instance:
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 futures = [
                     executor.submit(self._process_file_with_ui, file, ui_instance)
@@ -212,7 +212,8 @@ class DownloadSubset:
     
 
     def _log_download_error(self, file: EnhancedFile, error_msg: str) -> None:
-        ui.init_download_error_log()
+        
+        ui_download.init_download_error_log()
         logger = logging.getLogger("esgpull.download_errors")
         logger.error(
             "%s | node=%s | %s",
@@ -226,7 +227,7 @@ class DownloadSubset:
     def _finalize_failed_download(
         self,
         file: EnhancedFile,
-        ui_instance: ui.DownloadProgressUI,
+        ui_instance: ui_download.DownloadProgressUI,
         error_msg: str,
         status: str = "FAILED",
         original_error: Exception | None = None,
@@ -240,12 +241,12 @@ class DownloadSubset:
         ui_instance.complete_file(file)
         self.hide_file_after_delay(file, ui_instance, 5)
 
-    def _process_file_with_ui(self, file: EnhancedFile, ui_instance: ui.DownloadProgressUI) -> None:
+    def _process_file_with_ui(self, file: EnhancedFile, ui_instance: ui_download.DownloadProgressUI) -> None:
         """Process a file with the downloading progress UI.
         
         Args:
             file (esgpull.esgpullplus.enhanced_file.EnhancedFile): file object to process
-            ui_instance (ui.DownloadProgressUI): the downloading progress UI instance to update
+            ui_instance (ui_download.DownloadProgressUI): the downloading progress UI instance to update
         """
         try:
             ui_instance.set_status(file, "STARTING", "cyan")
@@ -288,7 +289,7 @@ class DownloadSubset:
     def _try_alternative_file(
         self,
         failed_file: EnhancedFile,
-        ui_instance: ui.DownloadProgressUI,
+        ui_instance: ui_download.DownloadProgressUI,
         original_error: Exception = None,
     ) -> bool:
         """
@@ -407,12 +408,12 @@ class DownloadSubset:
         else:
             return False
 
-    def _download_via_xarray_ui(self, file: EnhancedFile, ui_instance: ui.DownloadProgressUI) -> bool:
+    def _download_via_xarray_ui(self, file: EnhancedFile, ui_instance: ui_download.DownloadProgressUI) -> bool:
         """Download a file via xarray using the downloading progress UI.
         
         Args:
             file (esgpull.esgpullplus.enhanced_file.EnhancedFile): file object to download
-            ui_instance (ui.DownloadProgressUI): the downloading progress UI instance to update
+            ui_instance (ui_download.DownloadProgressUI): the downloading progress UI instance to update
 
         Returns (bool): True if the file was downloaded successfully, False otherwise
         """
@@ -451,14 +452,14 @@ class DownloadSubset:
         except Exception:
             return False
 
-    def _download_file_direct_ui(self, file: EnhancedFile, ui_instance: ui.DownloadProgressUI, max_retries: int = 3) -> bool:
+    def _download_file_direct_ui(self, file: EnhancedFile, ui_instance: ui_download.DownloadProgressUI, max_retries: int = 3) -> bool:
         """Download a file directly to the file system with resume capability and retry logic.
         
         Supports resuming partial downloads using HTTP Range requests for large files.
         
         Args:
             file (esgpull.esgpullplus.enhanced_file.EnhancedFile): file object to download
-            ui_instance (ui.DownloadProgressUI): the downloading progress UI instance to update
+            ui_instance (ui_download.DownloadProgressUI): the downloading progress UI instance to update
             max_retries (int): Maximum number of retry attempts on failure
 
         Returns (bool): True if the file was downloaded successfully, False otherwise
@@ -730,12 +731,12 @@ class DownloadSubset:
         return ds
 
     # Add a method to hide file after delay, called from main thread
-    def hide_file_after_delay(self, file: EnhancedFile, ui_instance: ui.DownloadProgressUI, delay_seconds: int) -> None:
+    def hide_file_after_delay(self, file: EnhancedFile, ui_instance: ui_download.DownloadProgressUI, delay_seconds: int) -> None:
         """Hide the file after a delay.
         
         Args:
             file (esgpull.esgpullplus.enhanced_file.EnhancedFile): file object to hide from the UI
-            ui_instance (ui.DownloadProgressUI): the downloading progress UI instance to update
+            ui_instance (ui_download.DownloadProgressUI): the downloading progress UI instance to update
             delay_seconds (int): the delay in seconds to hide the file
         """
         import threading
