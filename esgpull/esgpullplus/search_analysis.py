@@ -14,7 +14,6 @@ from typing import Optional
 
 import pandas as pd
 import numpy as np
-from matplotlib.colors import LogNorm
 
 from esgpull.esgpullplus import utils
 
@@ -296,6 +295,7 @@ def visualize_source_availability(
     try:
         import matplotlib.pyplot as plt
         import seaborn as sns
+        from matplotlib.colors import LogNorm
     except ImportError:
         raise ImportError(
             "matplotlib and seaborn are required for visualizations. "
