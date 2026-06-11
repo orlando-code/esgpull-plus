@@ -15,7 +15,7 @@ class _SkipFileError(Exception):
 # spatial
 import xarray as xa
 
-from esgpull.esgpullplus import ui, fileops
+from esgpull.esgpullplus import ui_download, fileops
 from esgpull.esgpullplus.enhanced_file import EnhancedFile
 from esgpull import utils
 # parallel

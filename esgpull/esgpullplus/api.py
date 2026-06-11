@@ -15,11 +15,9 @@ from esgpull.cli.utils import (
     parse_query,
     serialize_queries_from_file,
 )
-# TO DO
-# XX processing box
 
 # custom
-from esgpull.esgpullplus import download, fileops, search, esgpuller
+from esgpull.esgpullplus import download, fileops, search, esgpuller, ui_download
 from esgpull.graph import Graph
 from esgpull.models import File, Query
 from esgpull.tui import Verbosity
@@ -1132,9 +1130,8 @@ def run(symmetrical: bool = False):
 
             REPO_ROOT = fileops.get_repo_root()
             print("REPO ROOT:", REPO_ROOT)
-            from esgpull.esgpullplus import ui as download_ui
 
-            error_log_path = download_ui.init_download_error_log()
+            error_log_path = ui_download.init_download_error_log()
             rich_print(f"[dim]Download errors log: {error_log_path}[/dim]")
             CRITERIA_DICT = fileops.read_yaml(REPO_ROOT / "search.yaml")
             SEARCH_CRITERIA_CONFIG = CRITERIA_DICT.get("search_criteria", {})

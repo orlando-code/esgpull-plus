@@ -7,7 +7,6 @@ from typing import Any, Dict, List, Optional
 import sqlalchemy as sa
 from sqlalchemy.orm import Mapped, mapped_column
 from esgpull.models.file import FileStatus
-# from esgpull.models.file import FileDict as BaseFileDict
 from esgpull.models.utils import find_str, find_int, get_local_path
 from esgpull.models.base import Base
 from esgpull.models import File
