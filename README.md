@@ -34,7 +34,15 @@ pip install esgpull-plus
 conda install -c conda-forge python-cdo
 ```
 
-**3. Base esgpull:**
+**3. Optional – search analysis plots** (`matplotlib` + `seaborn`):
+
+```bash
+pip install "esgpull-plus[plotting]"
+# or, from a clone with rye:
+rye sync --features plotting
+```
+
+**4. Base esgpull:**
 
 ```bash
 esgpull self install
@@ -59,6 +67,7 @@ esgf-download/
 
 - **Base:** from `pyproject.toml` (httpx, click, rich, sqlalchemy, pydantic, etc.).
 - **esgpullplus:** pandas, numpy, requests, watchdog, xarray; geospatial via xesmf and `python-cdo` (conda).
+- **Optional `[plotting]`:** `matplotlib`, `seaborn` — for `run_search_analysis.py` and `SearchResults.visualize_*` (not required for search/download/regrid).
 
 ---
 
@@ -157,7 +166,7 @@ python run_search_analysis.py [OPTIONS]
 | `--show-plots` | True | Display plots interactively; pass `--show-plots` to disable. |
 | `--require-both` | True | Only include sources that have both historical and SSP experiments. |
 
-**Outputs:** `analysis_df.csv` plus, when `--save-plots` is on, `source_availability_heatmap.png`, `ensemble_counts.png`, `resolution_distribution.png`, `source_summary_table.png` in the output directory. Requires `matplotlib` and `seaborn` for plotting.
+**Outputs:** `analysis_df.csv` plus, when `--save-plots` is on, `source_availability_heatmap.png`, `ensemble_counts.png`, `resolution_distribution.png`, `source_summary_table.png` in the output directory. Plotting requires the optional extra: `pip install "esgpull-plus[plotting]"`.
 
 ---
 ## CDO regridding pipeline
