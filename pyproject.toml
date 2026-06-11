@@ -52,13 +52,13 @@ dependencies = [
     "psutil>=7.2.2",
     "cdo>=1.6.1",
 ]
+license = { text = "BSD-3-Clause" }
+
 [project.optional-dependencies]
 plotting = [
     "matplotlib>=3.7.0",
     "seaborn>=0.13.0",
 ]
-
-license.text = "BSD-3-Clause"
 
 [project.scripts]
 esgpull = "esgpull.cli:main"
