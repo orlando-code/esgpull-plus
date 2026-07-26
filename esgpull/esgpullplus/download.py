@@ -342,6 +342,16 @@ class DownloadSubset:
             )
             
             if not alternatives:
+                mirrors = self.api_instance.synthesize_esgf_mirror_urls(file_dict)
+                if mirrors:
+                    if self.verbose:
+                        rich_print(
+                            f"[blue]Trying {len(mirrors)} synthesized mirror URL(s) for "
+                            f"{failed_file.filename}[/blue]"
+                        )
+                    alternatives = mirrors
+
+            if not alternatives:
                 return False
             
             # Try each alternative until one succeeds
@@ -447,7 +457,7 @@ class DownloadSubset:
         Returns (bool): True if the URL is accessible, False otherwise
         """
         try:
-            response = requests.head(url, timeout=10)
+            response = requests.head(url, timeout=60)
             return response.status_code == 200
         except Exception:
             return False

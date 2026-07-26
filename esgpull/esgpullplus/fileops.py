@@ -44,6 +44,15 @@ def get_repo_root():
     return Path(__file__).resolve().parent.parent.parent
 
 
+def resolve_search_config_path(config_path: str | Path | None = None) -> Path:
+    """Resolve ``search.yaml`` (or another config path) relative to the repo root."""
+    repo_root = get_repo_root()
+    path = Path(config_path) if config_path is not None else repo_root / "search.yaml"
+    if not path.is_absolute():
+        path = (repo_root / path).resolve()
+    return path
+
+
 def read_yaml(file_path):
     """Read a YAML file, returning None if it doesn't exist."""
     import yaml

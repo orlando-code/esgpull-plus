@@ -173,7 +173,11 @@ def test_search_and_download_batches_and_wires_downloadsubset(monkeypatch, tmp_p
     # Use a lightweight API object with a stub fs
     fake_api = types.SimpleNamespace(esg=types.SimpleNamespace(fs=DummyFS()))
 
-    search_criteria = {"project": "CMIP6", "variable": "tas"}
+    search_criteria = {
+        "project": "CMIP6",
+        "variable": "tas",
+        "experiment_id": "historical",
+    }
     meta_criteria = {
         "data_dir": str(tmp_path),
         "batch_size": 3,
@@ -197,4 +201,71 @@ def test_search_and_download_batches_and_wires_downloadsubset(monkeypatch, tmp_p
     for kwargs in constructed_subsets:
         assert kwargs["find_alternatives"] is True
         assert kwargs["api_instance"] is fake_api
+
+
+def _make_file(filename: str, experiment_id: str) -> dict:
+    return {"filename": filename, "experiment_id": experiment_id}
+
+
+def test_parse_year_range_from_filename():
+    parsed = api_mod._parse_year_range_from_filename(
+        "tos_Omon_model_historical_r1i1p1f1_gn_185001-201412.nc"
+    )
+    assert parsed == (1850, 2014)
+
+
+def test_file_in_year_range_overlap():
+    file_obj = _make_file("tos_Omon_model_historical_r1i1p1f1_gn_200001-200912.nc", "historical")
+    assert api_mod._file_in_year_range(file_obj, 2000, 2015)
+    assert not api_mod._file_in_year_range(file_obj, 2010, 2020)
+
+
+def test_year_filter_config_period_specific():
+    config = api_mod.parse_year_filter_config(
+        {
+            "historic_start_year": 1850,
+            "historic_end_year": 2014,
+            "future_start_year": 2015,
+            "future_end_year": 2100,
+        }
+    )
+    assert config.uses_period_ranges
+    assert config.bounds_for_experiment("historical") == (1850, 2014)
+    assert config.bounds_for_experiment("ssp245") == (2015, 2100)
+    assert config.bounds_for_experiment("piControl") == (None, None)
+
+
+def test_year_filter_config_period_with_global_fallback():
+    config = api_mod.parse_year_filter_config(
+        {
+            "start_year": 1900,
+            "end_year": 2100,
+            "historic_end_year": 2014,
+            "future_start_year": 2015,
+        }
+    )
+    assert config.bounds_for_experiment("historical") == (1900, 2014)
+    assert config.bounds_for_experiment("ssp370") == (2015, 2100)
+
+
+def test_filter_files_by_year_config_mixed_experiments():
+    files = [
+        _make_file("tos_Omon_model_historical_r1i1p1f1_gn_185001-187912.nc", "historical"),
+        _make_file("tos_Omon_model_historical_r1i1p1f1_gn_200001-200912.nc", "historical"),
+        _make_file("tos_Omon_model_ssp245_r1i1p1f1_gn_201501-203012.nc", "ssp245"),
+        _make_file("tos_Omon_model_ssp245_r1i1p1f1_gn_204001-206012.nc", "ssp245"),
+    ]
+    config = api_mod.parse_year_filter_config(
+        {
+            "historic_start_year": 1850,
+            "historic_end_year": 1900,
+            "future_start_year": 2015,
+            "future_end_year": 2030,
+        }
+    )
+    kept = api_mod.filter_files_by_year_config(files, config)
+    assert [f["filename"] for f in kept] == [
+        "tos_Omon_model_historical_r1i1p1f1_gn_185001-187912.nc",
+        "tos_Omon_model_ssp245_r1i1p1f1_gn_201501-203012.nc",
+    ]
 

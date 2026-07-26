@@ -2,10 +2,10 @@
 Asynchronous file watcher and regrid processor.
 
 Watches a directory (and its subdirectories) for new NetCDF files and
-automatically regrids them using the CDO pipeline from ``cdo_regrid``.
+automatically regrids them using the CDO pipeline from ``cdo_toolkit``.
 
 This provides a non-sequential (event-driven) alternative to running
-``cdo_regrid.regrid_directory`` manually after all downloads complete.
+``cdo_toolkit.regrid_directory`` manually after all downloads complete.
 Files are processed in batches as they appear, grouped by subdirectory
 so that regridding weights can be reused within each model/variable
 directory.
@@ -42,6 +42,7 @@ from typing import Optional, Set
 
 log = logging.getLogger(__name__)
 
+from esgpull.esgpullplus import cdo_optional
 from rich.console import Console
 
 
@@ -124,7 +125,7 @@ class AsyncRegridProcessor:
     Asynchronously processes NetCDF files for regridding.
 
     Files are collected in a queue, batched by subdirectory, and regridded
-    using :func:`cdo_regrid._process_single_file_standalone` (the same
+    using :func:`cdo_toolkit.process_single_file_standalone` (the same
     function used by ``CDORegridPipeline.regrid_batch``).
 
     Only fully-formed .nc files are queued: after a path is seen, the processor
@@ -246,7 +247,8 @@ class AsyncRegridProcessor:
         files = deduped
 
         from concurrent.futures import ProcessPoolExecutor
-        from esgpull.esgpullplus.cdo_regrid import _process_single_file_standalone
+
+        process_single_file_standalone = cdo_optional.get_process_single_file_standalone()
 
         self.weight_cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -257,8 +259,9 @@ class AsyncRegridProcessor:
             for fp in files:
                 future = loop.run_in_executor(
                     executor,
-                    _process_single_file_standalone,
+                    process_single_file_standalone,
                     fp,
+                    None,
                     self.target_resolution,
                     self.target_grid,
                     self.weight_cache_dir,

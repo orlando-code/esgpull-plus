@@ -33,8 +33,6 @@ backrefs==7.0
     # via mkdocs-material
 cattrs==26.1.0
     # via esgpull-plus
-cdo==1.6.1
-    # via esgpull-plus
 certifi==2026.5.20
     # via httpcore
     # via httpx
@@ -155,7 +153,6 @@ numpy==2.4.6
 orjson==3.11.9
     # via esgpull-plus
 packaging==26.2
-    # via cdo
     # via esgpull-plus
     # via ipykernel
     # via mkdocs
@@ -184,7 +181,6 @@ prompt-toolkit==3.0.52
     # via ipython
     # via jupyter-console
 psutil==7.2.2
-    # via esgpull-plus
     # via ipykernel
     # via ipython
 ptyprocess==0.7.0
@@ -246,7 +242,6 @@ rich==15.0.0
 setuptools==82.0.1
     # via esgpull-plus
 six==1.17.0
-    # via cdo
     # via python-dateutil
 sqlalchemy==2.0.50
     # via alembic

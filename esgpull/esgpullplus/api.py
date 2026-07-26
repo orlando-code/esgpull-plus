@@ -3,6 +3,7 @@ import signal
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, cast
 from datetime import datetime, timezone
@@ -17,7 +18,7 @@ from esgpull.cli.utils import (
 )
 
 # custom
-from esgpull.esgpullplus import download, fileops, search, esgpuller, ui_download
+from esgpull.esgpullplus import cdo_optional, download, fileops, search, esgpuller, ui_download
 from esgpull.graph import Graph
 from esgpull.models import File, Query
 from esgpull.tui import Verbosity
@@ -110,6 +111,7 @@ class EsgpullAPI:
         tags = _criteria.pop("tags", [])
         # Remove filter key as it's not a search facet
         _criteria.pop("filter", None)
+        _criteria = search.prepare_esgf_search_criteria(_criteria)
         
         # Try distributed search first (queries multiple nodes)
         query = parse_query(
@@ -127,12 +129,14 @@ class EsgpullAPI:
         try:
             from esgpull.esgpullplus.enhanced_context import EnhancedContext
             local_ctx = EnhancedContext(config=self.esg.config, noraise=True)
-            results = local_ctx.search(query, file=file, max_hits=max_hits)
-            # Dataset results are already dicts; file results are EnhancedFile
-            return [
-                r.asdict() if hasattr(r, "asdict") else r
-                for r in results
-            ]
+            results = self._execute_search(local_ctx, query, file=file, max_hits=max_hits)
+            if not results:
+                rich_print(
+                    "[yellow]Primary ESGF search returned no results; "
+                    "trying alternative index nodes...[/yellow]"
+                )
+                return self._search_with_retry(_criteria, tags, max_hits, file=file)
+            return results
         except (IndexError, ValueError) as e:
             # Handle empty hits that cause IndexError in _distribute_hits_impl
             error_msg = str(e).lower()
@@ -145,14 +149,27 @@ class EsgpullAPI:
                 return []
             raise
         except Exception as e:
-            # If distributed search fails with 500 error, try alternative nodes
-            if self._is_server_error(e):
+            # If distributed search fails, try alternative nodes
+            if self._is_retryable_search_error(e):
                 rich_print(
-                    "[yellow]⚠️  Distributed search failed with server error. "
-                    "Retrying with alternative ESGF nodes...[/yellow]"
+                    "[yellow]Primary ESGF search failed; "
+                    "retrying with alternative index nodes...[/yellow]"
                 )
                 return self._search_with_retry(_criteria, tags, max_hits, file=file)
             raise
+
+    def _execute_search(
+        self,
+        local_ctx: Any,
+        query: Query,
+        file: bool,
+        max_hits: Optional[int],
+    ) -> List[Dict[str, Any]]:
+        results = local_ctx.search(query, file=file, max_hits=max_hits)
+        return [
+            r.asdict() if hasattr(r, "asdict") else r
+            for r in results
+        ]
     
     def _facets_to_criteria(self, facets: List[str]) -> Dict[str, Any]:
         """
@@ -162,6 +179,24 @@ class EsgpullAPI:
         """
         selection = parse_facets(facets)
         return {k: ",".join(v) if len(v) > 1 else v[0] for k, v in selection.items()}
+
+    def _is_retryable_search_error(self, exception: Exception) -> bool:
+        """Return True when another ESGF index node may succeed."""
+        import httpx
+
+        if self._is_server_error(exception):
+            return True
+        if isinstance(
+            exception,
+            (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError),
+        ):
+            return True
+        if isinstance(exception, BaseExceptionGroup):
+            return any(
+                self._is_retryable_search_error(exc)
+                for exc in exception.exceptions
+            )
+        return False
 
     def _is_server_error(self, exception: Exception) -> bool:
         """Check if exception is a server error (500, 502, 503, etc.)."""
@@ -193,12 +228,13 @@ class EsgpullAPI:
         Returns:
             List of search results
         """
-        # List of alternative ESGF nodes to try
+        # List of alternative ESGF nodes to try (DKRZ first; CEDA often unreachable)
         alternative_nodes = [
             "esgf-data.dkrz.de",
-            "esgf.ceda.ac.uk",
             "esgf-node.llnl.gov",
             "esgf-node.ornl.gov",
+            "esgdata.gfdl.noaa.gov",
+            "esgf.ceda.ac.uk",
         ]
         
         # Try to fetch available nodes first
@@ -334,6 +370,45 @@ class EsgpullAPI:
                 break
         return result
 
+    @staticmethod
+    def synthesize_esgf_mirror_urls(failed_file: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Build download URLs on other ESGF THREDDS mirrors from local_path/filename.
+
+        GFDL files are often indexed only on esgdata.gfdl.noaa.gov, which may be
+        unreachable from some networks. The same files are frequently available on
+        DKRZ or ORNL using predictable URL patterns.
+        """
+        local_path = str(failed_file.get("local_path") or "").strip("/")
+        filename = failed_file.get("filename")
+        if not local_path or not filename:
+            return []
+
+        path_full = local_path
+        path_short = (
+            local_path[len("CMIP6/") :]
+            if local_path.startswith("CMIP6/")
+            else local_path
+        )
+        failed_node = str(failed_file.get("data_node") or "")
+        failed_url = str(failed_file.get("url") or "")
+
+        mirror_templates = [
+            ("esgf3.dkrz.de", f"https://esgf3.dkrz.de/thredds/fileServer/cmip6/{path_short}/{filename}"),
+            ("esgf-data.dkrz.de", f"https://esgf-data.dkrz.de/thredds/fileServer/cmip6/{path_short}/{filename}"),
+            ("esgf-node.ornl.gov", f"https://esgf-node.ornl.gov/thredds/fileServer/css03_data/{path_full}/{filename}"),
+            ("esgf.ceda.ac.uk", f"https://esgf.ceda.ac.uk/thredds/fileServer/esg_cmip6/{path_full}/{filename}"),
+        ]
+
+        mirrors: list[dict] = []
+        for node, url in mirror_templates:
+            if node in failed_node or url == failed_url:
+                continue
+            alt = dict(failed_file)
+            alt["url"] = url
+            alt["data_node"] = node
+            mirrors.append(alt)
+        return mirrors
+
     def find_alternative_files(
         self,
         failed_file: Dict[str, Any],
@@ -365,8 +440,7 @@ class EsgpullAPI:
         search_criteria = {k: v for k, v in search_criteria.items() if v is not None}
         
         if not search_criteria.get("variable"):
-            # Can't search without variable
-            return []
+            return self.synthesize_esgf_mirror_urls(failed_file)
         
         cached = self._alternatives_from_search_cache(failed_file)
         if cached:
@@ -451,11 +525,13 @@ class EsgpullAPI:
             # Sort by score (highest first) and return
             filtered_alternatives.sort(key=lambda x: x[0], reverse=True)
             result = [alt for _, alt in filtered_alternatives[:5]]  # Return top 5
-            
-            return result
-            
+
         except Exception:
-            return []
+            result = []
+
+        if not result:
+            result = self.synthesize_esgf_mirror_urls(failed_file)
+        return result
 
 
     def add(self, criteria: Dict[str, Any], track: bool = False) -> None:
@@ -712,6 +788,16 @@ def _parse_year_range_from_filename(filename: str) -> Optional[tuple[int, int]]:
         return None
 
 
+def _file_record_field(file_obj: Any, field: str) -> Any:
+    """Read a field from a File object, dict record, or asdict()-able object."""
+    if isinstance(file_obj, dict):
+        return file_obj.get(field)
+    value = getattr(file_obj, field, None)
+    if value is None and hasattr(file_obj, "asdict"):
+        return file_obj.asdict().get(field)
+    return value
+
+
 def _file_in_year_range(
     file_obj: Any,
     start_year: Optional[int],
@@ -726,9 +812,7 @@ def _file_in_year_range(
 
     File range is parsed from filename (_YYYYMM-YYYYMM). If unparseable, keep the file (assume in range).
     """
-    filename = getattr(file_obj, "filename", None)
-    if filename is None and hasattr(file_obj, "asdict"):
-        filename = file_obj.asdict().get("filename")
+    filename = _file_record_field(file_obj, "filename")
     if not filename:
         return True
     parsed = _parse_year_range_from_filename(str(filename))
@@ -742,6 +826,174 @@ def _file_in_year_range(
     if start_year is not None:
         return file_start_year >= start_year
     return True
+
+
+def _parse_optional_year(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _get_file_experiment_id(file_obj: Any) -> Optional[str]:
+    experiment_id = _file_record_field(file_obj, "experiment_id")
+    if experiment_id is None:
+        return None
+    text = str(experiment_id).strip()
+    return text or None
+
+
+def _classify_experiment_period(
+    experiment_id: Optional[str],
+    *,
+    historical_experiment: str = "historical",
+    ssp_pattern: str = "ssp",
+) -> str:
+    """Return ``historical``, ``future`` (SSP), or ``other``."""
+    if not experiment_id:
+        return "other"
+    exp = experiment_id.lower()
+    if exp == historical_experiment.lower():
+        return "historical"
+    if exp.startswith(ssp_pattern.lower()):
+        return "future"
+    return "other"
+
+
+@dataclass(frozen=True)
+class YearFilterConfig:
+    """Year-range filters for downloads, optionally split by experiment period."""
+
+    global_start: Optional[int] = None
+    global_end: Optional[int] = None
+    historic_start: Optional[int] = None
+    historic_end: Optional[int] = None
+    future_start: Optional[int] = None
+    future_end: Optional[int] = None
+    historical_experiment: str = "historical"
+    ssp_pattern: str = "ssp"
+
+    @property
+    def is_active(self) -> bool:
+        return any(
+            value is not None
+            for value in (
+                self.global_start,
+                self.global_end,
+                self.historic_start,
+                self.historic_end,
+                self.future_start,
+                self.future_end,
+            )
+        )
+
+    @property
+    def uses_period_ranges(self) -> bool:
+        return any(
+            value is not None
+            for value in (
+                self.historic_start,
+                self.historic_end,
+                self.future_start,
+                self.future_end,
+            )
+        )
+
+    def bounds_for_experiment(self, experiment_id: Optional[str]) -> tuple[Optional[int], Optional[int]]:
+        """Resolve start/end years for a file based on its experiment."""
+        if self.uses_period_ranges:
+            period = _classify_experiment_period(
+                experiment_id,
+                historical_experiment=self.historical_experiment,
+                ssp_pattern=self.ssp_pattern,
+            )
+            if period == "historical":
+                return (
+                    self.historic_start if self.historic_start is not None else self.global_start,
+                    self.historic_end if self.historic_end is not None else self.global_end,
+                )
+            if period == "future":
+                return (
+                    self.future_start if self.future_start is not None else self.global_start,
+                    self.future_end if self.future_end is not None else self.global_end,
+                )
+        return self.global_start, self.global_end
+
+    def describe(self) -> str:
+        if self.uses_period_ranges:
+            parts = []
+            if self.historic_start is not None or self.historic_end is not None:
+                parts.append(
+                    f"historical={self._fmt_range(self.historic_start, self.historic_end)}"
+                )
+            if self.future_start is not None or self.future_end is not None:
+                parts.append(
+                    f"future={self._fmt_range(self.future_start, self.future_end)}"
+                )
+            if self.global_start is not None or self.global_end is not None:
+                parts.append(
+                    f"fallback={self._fmt_range(self.global_start, self.global_end)}"
+                )
+            return ", ".join(parts)
+        return self._fmt_range(self.global_start, self.global_end)
+
+    @staticmethod
+    def _fmt_range(start: Optional[int], end: Optional[int]) -> str:
+        if start is not None and end is not None:
+            return f"[{start}-{end}]"
+        if end is not None:
+            return f"<= {end}"
+        if start is not None:
+            return f">= {start}"
+        return "any"
+
+
+def parse_year_filter_config(meta_criteria: dict) -> YearFilterConfig:
+    """
+    Build year-filter settings from ``meta_criteria``.
+
+    Supports legacy ``start_year`` / ``end_year`` plus period-specific keys for
+    symmetrical historical + SSP downloads:
+
+    - ``historic_start_year``, ``historic_end_year``
+    - ``future_start_year``, ``future_end_year``
+    """
+    historical_experiment = str(
+        meta_criteria.get("historical_experiment", "historical")
+    )
+    ssp_pattern = str(meta_criteria.get("ssp_pattern", "ssp"))
+    return YearFilterConfig(
+        global_start=_parse_optional_year(meta_criteria.get("start_year")),
+        global_end=_parse_optional_year(meta_criteria.get("end_year")),
+        historic_start=_parse_optional_year(meta_criteria.get("historic_start_year")),
+        historic_end=_parse_optional_year(meta_criteria.get("historic_end_year")),
+        future_start=_parse_optional_year(meta_criteria.get("future_start_year")),
+        future_end=_parse_optional_year(meta_criteria.get("future_end_year")),
+        historical_experiment=historical_experiment,
+        ssp_pattern=ssp_pattern,
+    )
+
+
+def filter_files_by_year_config(
+    files: list[Any],
+    year_filter: YearFilterConfig,
+) -> list[Any]:
+    """Apply experiment-aware year filtering to downloaded file records."""
+    if not year_filter.is_active:
+        return files
+    kept: list[Any] = []
+    for file_obj in files:
+        start_year, end_year = year_filter.bounds_for_experiment(
+            _get_file_experiment_id(file_obj)
+        )
+        if start_year is None and end_year is None:
+            kept.append(file_obj)
+            continue
+        if _file_in_year_range(file_obj, start_year, end_year):
+            kept.append(file_obj)
+    return kept
 
 
 def resolve_download_output_dir(
@@ -785,7 +1037,8 @@ def search_and_download(search_criteria, meta_criteria, API=None, symmetrical=Fa
     
     Args:
         search_criteria: Dictionary of search criteria
-        meta_criteria: Dictionary of metadata criteria (may include start_year, end_year for time filter)
+        meta_criteria: Dictionary of metadata criteria (may include start_year/end_year
+            or historic_start_year/historic_end_year/future_start_year/future_end_year)
         API: Optional EsgpullAPI instance
         symmetrical: If True, only download files from sources that have both 
                     historical and SSP experiments available
@@ -794,6 +1047,14 @@ def search_and_download(search_criteria, meta_criteria, API=None, symmetrical=Fa
     # Check for shutdown request
     if _shutdown_requested.is_set():
         rich_print("[yellow]Shutdown requested, skipping search and download.[/yellow]")
+        return
+
+    missing_facets = search.missing_limiting_search_facets(search_criteria)
+    if missing_facets:
+        rich_print(
+            "[red bold]Configuration error:[/red bold] "
+            f"{search.format_missing_limiting_facets_message(missing_facets)}"
+        )
         return
 
     # load configuration - use file=True for downloads (need url, filename, local_path)
@@ -811,40 +1072,15 @@ def search_and_download(search_criteria, meta_criteria, API=None, symmetrical=Fa
     files = search_results.run()
 
     if not files:
-        rich_print("No files found matching the search criteria.")
-        return
-
-    # Filter by year range (meta_criteria start_year / end_year) if either is set
-    start_year = meta_criteria.get("start_year")
-    end_year = meta_criteria.get("end_year")
-    if start_year is not None:
-        try:
-            start_year = int(start_year)
-        except (TypeError, ValueError):
-            start_year = None
-    if end_year is not None:
-        try:
-            end_year = int(end_year)
-        except (TypeError, ValueError):
-            end_year = None
-    if start_year is not None or end_year is not None:
-        original_count = len(files)
-        files = [f for f in files if _file_in_year_range(f, start_year, end_year)]
-        removed = original_count - len(files)
-        if removed > 0:
-            if start_year is not None and end_year is not None:
-                range_msg = f"[{start_year}-{end_year}]"
-            elif end_year is not None:
-                range_msg = f"before or in {end_year} (end_year)"
-            else:
-                range_msg = f"from {start_year} onward (start_year)"
+        missing_facets = search.missing_limiting_search_facets(search_criteria)
+        if missing_facets:
             rich_print(
-                f"[cyan]📅 Time filter {range_msg}: removed {removed} file(s) outside range "
-                f"({len(files)} remaining)[/cyan]"
+                "[red bold]Configuration error:[/red bold] "
+                f"{search.format_missing_limiting_facets_message(missing_facets)}"
             )
-        if not files:
-            rich_print("No files remaining after time range filter.")
-            return
+        else:
+            rich_print("No files found matching the search criteria.")
+        return
 
     # Filter for symmetrical datasets if requested
     if symmetrical:
@@ -940,13 +1176,13 @@ def search_and_download(search_criteria, meta_criteria, API=None, symmetrical=Fa
                 if hasattr(file, 'institution_id') and hasattr(file, 'source_id'):
                     inst_id = getattr(file, 'institution_id', None)
                     src_id = getattr(file, 'source_id', None)
-                    var = getattr(file, 'variable', None)
+                    var = getattr(file, 'variable', None) or getattr(file, 'variable_id', None)
                 elif hasattr(file, 'asdict'):
                     # Fallback: convert to dict and check
                     file_dict = file.asdict()
                     inst_id = file_dict.get("institution_id")
                     src_id = file_dict.get("source_id")
-                    var = file_dict.get("variable")
+                    var = file_dict.get("variable") or file_dict.get("variable_id")
                 
                 # Normalize values for consistent matching
                 inst_id = normalize_value(inst_id)
@@ -1087,55 +1323,65 @@ def remove_part_files(main_dir: Path) -> None:
             rich_print(f"Failed to remove {part_file}: {e}")
 
 
-def run(symmetrical: bool = False):
+def run_download(symmetrical: bool = False, config_path: str | Path | None = None):
     """
-    Main run function with graceful interrupt handling.
-    
+    Search and download from a YAML config (no argparse; use :func:`main` for CLI).
+
     Args:
-        symmetrical: If True, only download files from sources that have both 
-                     historical and SSP experiments available. Defaults to False.
-                     When called from CLI, this is overridden by --symmetrical flag.
+        symmetrical: If True, only download files from sources that have both
+            historical and SSP experiments available.
+        config_path: Path to search YAML. Defaults to ``search.yaml`` in the repo root.
     """
-    import argparse
-    import sys
-    
-    # Only parse command-line arguments if called from CLI (not from notebook/REPL)
-    # Check if we're in IPython/Jupyter by looking for IPython in sys.modules
-    is_notebook = 'IPython' in sys.modules or 'ipykernel' in sys.modules
-    
-    if not is_notebook and len(sys.argv) > 1:
-        # Parse command-line arguments
-        parser = argparse.ArgumentParser(
-            description="ESGF search and download tool with symmetrical dataset filtering"
-        )
-        parser.add_argument(
-            "--symmetrical",
-            action="store_true",
-            help="Only download files from sources that have both historical and SSP experiments available (symmetrical datasets)",
-        )
-        args = parser.parse_args()
-        symmetrical = args.symmetrical
-    
+    config_path = fileops.resolve_search_config_path(config_path)
+    repo_root = fileops.get_repo_root()
+
     with GracefulInterruptHandler():
         try:
-            # Show startup message with interrupt info
             rich_print(
                 "[dim]💡 Tip: Press Ctrl+C at any time for graceful shutdown[/dim]"
             )
-            
+
             if symmetrical:
                 rich_print(
                     "[cyan]🔍 Symmetrical mode enabled: Only downloading datasets with both historical and SSP experiments[/cyan]"
                 )
 
-            REPO_ROOT = fileops.get_repo_root()
+            REPO_ROOT = repo_root
             print("REPO ROOT:", REPO_ROOT)
+
+            if not config_path.exists():
+                rich_print(
+                    f"[red bold]Configuration error:[/red bold] "
+                    f"Search config not found: {config_path}"
+                )
+                sys.exit(1)
+
+            rich_print(f"[cyan]Using search config: {config_path}[/cyan]")
 
             error_log_path = ui_download.init_download_error_log()
             rich_print(f"[dim]Download errors log: {error_log_path}[/dim]")
-            CRITERIA_DICT = fileops.read_yaml(REPO_ROOT / "search.yaml")
+            CRITERIA_DICT = fileops.read_yaml(config_path)
+            if not CRITERIA_DICT:
+                rich_print(
+                    f"[red bold]Configuration error:[/red bold] "
+                    f"Could not read search config: {config_path}"
+                )
+                sys.exit(1)
             SEARCH_CRITERIA_CONFIG = CRITERIA_DICT.get("search_criteria", {})
             META_CRITERIA_CONFIG = CRITERIA_DICT.get("meta_criteria", {})
+
+            year_filter = parse_year_filter_config(META_CRITERIA_CONFIG)
+            if year_filter.is_active:
+                rich_print(
+                    f"[cyan]📅 Time filter: {year_filter.describe()}[/cyan]"
+                )
+
+            try:
+                search.validate_limiting_search_criteria(SEARCH_CRITERIA_CONFIG)
+            except ValueError as exc:
+                rich_print(f"[red bold]Configuration error:[/red bold] {exc}")
+                sys.exit(1)
+
             API = EsgpullAPI()
 
             # remove any existing .part files in the download directory to avoid conflicts
@@ -1293,7 +1539,7 @@ def run(symmetrical: bool = False):
             if not _shutdown_requested.is_set() and META_CRITERIA_CONFIG.get("regrid", False):
                 rich_print("[cyan]Regridding enabled, running regridding...[/cyan]")
                 try:
-                    from esgpull.esgpullplus.cdo_regrid import regrid_directory
+                    regrid_directory = cdo_optional.get_regrid_directory()
                     target_res = META_CRITERIA_CONFIG.get("regrid_resolution", (1.0, 1.0))
                     if isinstance(target_res, (list, tuple)) and len(target_res) == 2:
                         target_res = tuple(target_res)
@@ -1324,5 +1570,34 @@ def run(symmetrical: bool = False):
             raise
 
 
+def main(argv: list[str] | None = None) -> None:
+    """CLI entry: search and download from ``search.yaml`` (or ``--config``)."""
+    import argparse
+
+    default_config = fileops.resolve_search_config_path()
+    parser = argparse.ArgumentParser(
+        description="ESGF search and download tool with symmetrical dataset filtering"
+    )
+    parser.add_argument(
+        "--symmetrical",
+        action="store_true",
+        help="Only download sources with both historical and SSP experiments",
+    )
+    parser.add_argument(
+        "--config",
+        "--config-path",
+        dest="config_path",
+        type=str,
+        default=str(default_config),
+        help="Path to search YAML (default: search.yaml in repo root)",
+    )
+    args = parser.parse_args(argv)
+    run_download(symmetrical=args.symmetrical, config_path=args.config_path)
+
+
+# Programmatic alias (notebooks, scripts)
+run = run_download
+
+
 if __name__ == "__main__":
-    run()
+    main()

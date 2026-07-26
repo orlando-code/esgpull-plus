@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "esgpull-plus"
-version = "1.0.0"
+version = "1.1.0"
 classifiers = [
     "License :: OSI Approved :: BSD License",
     "Programming Language :: Python :: 3",
@@ -49,8 +49,6 @@ dependencies = [
     "requests>=2.28.0",
     "orjson>=3.8.0",
     "cftime>=1.6.5",
-    "psutil>=7.2.2",
-    "cdo>=1.6.1",
 ]
 license = { text = "BSD-3-Clause" }
 
@@ -59,9 +57,13 @@ plotting = [
     "matplotlib>=3.7.0",
     "seaborn>=0.13.0",
 ]
+processing = [
+    "cdo-toolkit>=0.1.0",
+]
 
 [project.scripts]
 esgpull = "esgpull.cli:main"
+esgplus = "esgpull.esgpullplus.cli:main"
 esgpullplus-download = "esgpull.esgpullplus.api:main"
 
 [project.urls]
@@ -135,6 +137,7 @@ dev-dependencies = [
 
 [tool.rye.scripts]
 esg = { cmd = "esgpull", env-file = ".env" }
+esgplus = { cmd = "python -m esgpull.esgpullplus.cli", env-file = ".env" }
 
 [dependency-groups]
 dev = [

@@ -99,9 +99,9 @@ def test_async_regrid_processor_process_batch_uses_stubbed_regrid(tmp_path, monk
         }
 
     monkeypatch.setattr(
-        "esgpull.esgpullplus.cdo_regrid._process_single_file_standalone",
-        fake_process_single_file_standalone,
-        raising=True,
+        fw.cdo_optional,
+        "get_process_single_file_standalone",
+        lambda: fake_process_single_file_standalone,
     )
     # Use ThreadPoolExecutor so we don't spawn processes (avoids PermissionError in CI)
     monkeypatch.setattr(

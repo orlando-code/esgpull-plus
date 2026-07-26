@@ -26,20 +26,38 @@ API and processing extension to [esgf-download](https://github.com/ESGF/esgf-dow
 
 ```bash
 pip install esgpull-plus
+# or from a clone:
+rye sync
 ```
 
-**2. Optional – CDO regridding** (conda recommended):
+After install, use the **`esgplus`** CLI for search and download:
 
 ```bash
-conda install -c conda-forge python-cdo
+esgplus download          # search + download (reads search.yaml by default)
+esgplus search            # search only
+esgplus search-analysis   # availability analysis + optional plots
 ```
 
-**3. Optional – search analysis plots** (`matplotlib` + `seaborn`):
+From a dev checkout before `rye sync` completes, the same commands work via:
+
+```bash
+python -m esgpull.esgpullplus.cli download
+```
+
+**2. Optional – search analysis plots** (`matplotlib` + `seaborn`):
 
 ```bash
 pip install "esgpull-plus[plotting]"
 # or, from a clone with rye:
 rye sync --features plotting
+```
+
+**3. Optional – CDO regridding / post-processing** (`cdo-toolkit`):
+
+```bash
+pip install "esgpull-plus[processing]"
+# CDO binary (conda recommended):
+conda install -c conda-forge cdo
 ```
 
 **4. Base esgpull:**
@@ -57,9 +75,11 @@ See [esgf-download installation](https://esgf.github.io/esgf-download/installati
 ```
 esgf-download/
 ├── esgpull/              # Original esgpull
-│   └── esgpullplus/      # Extensions (regrid, API, etc.)
+│   └── esgpullplus/      # Download API, file watcher, load_data, …
 ├── update-from-upstream.sh
 ```
+
+Regridding lives in the separate **[cdo-toolkit](https://pypi.org/project/cdo-toolkit/)** package (optional `[processing]` extra).
 
 ---
 
@@ -67,7 +87,8 @@ esgf-download/
 
 - **Base:** from `pyproject.toml` (httpx, click, rich, sqlalchemy, pydantic, etc.).
 - **esgpullplus:** pandas, numpy, requests, watchdog, xarray; geospatial via xesmf and `python-cdo` (conda).
-- **Optional `[plotting]`:** `matplotlib`, `seaborn` — for `run_search_analysis.py` and `SearchResults.visualize_*` (not required for search/download/regrid).
+- **Optional `[plotting]`:** `matplotlib`, `seaborn` — for `esgplus search-analysis` and `SearchResults.visualize_*` (not required for search/download).
+- **Optional `[processing]`:** `cdo-toolkit` — for post-download regridding and the async file watcher (also requires the CDO binary).
 
 ---
 
@@ -124,8 +145,23 @@ meta_criteria:
 Run the search + download pipeline (uses `search.yaml` automatically):
 
 ```bash
+esgplus download
+esgplus download --symmetrical   # only sources with both historical + SSP experiments
+esgplus download --config path/to/search.yaml
+```
+
+Search only (no download):
+
+```bash
+esgplus search
+esgplus search --config path/to/search.yaml
+```
+
+Legacy equivalents:
+
+```bash
 python -m esgpull.esgpullplus.api
-python -m esgpull.esgpullplus.api --symmetrical  # only download sources with both historical + SSP experiments
+esgpullplus-download
 ```
 
 - **Symmetry:** in `--symmetrical` mode the tool first analyses all experiments and then only downloads datasets from sources that have both historical and SSP-style experiments (e.g. `ssp*`), so historical/SSP are matched.
@@ -137,7 +173,7 @@ python -m esgpull.esgpullplus.api --symmetrical  # only download sources with bo
 | Key | Description |
 |-----|-------------|
 | `search_criteria.*` | ESGF facets (project, table_id, experiment_id, variable/variable_id, frequency, etc.). |
-| `search_criteria.filter.top_n` | Number of top grouped datasets to keep. |
+| `search_criteria.filter.top_n` | Number of top grouped datasets to keep **per variable and experiment**. |
 | `search_criteria.filter.limit` | Maximum number of results per sub-search (useful for debugging). |
 | `meta_criteria.test` | If `true` (default), downloads go flat to `test_downloads/` in the repo. Set `false` to use `data_dir` with CMIP6 directory layout. |
 | `meta_criteria.data_dir` | Base directory for downloaded data and cached search results (used when `test: false`). |
@@ -145,18 +181,26 @@ python -m esgpull.esgpullplus.api --symmetrical  # only download sources with bo
 | `meta_criteria.max_workers` | Worker count used for any post-download regridding. |
 | `meta_criteria.regrid_variables` | Optional list of CMIP variable prefixes to regrid after download (e.g. `tos`). |
 | `meta_criteria.find_alternatives` | If `true` (default), retry failed downloads from other ESGF data nodes. |
+| `meta_criteria.start_year` / `end_year` | Optional global year filter applied to all files (filename `_YYYYMM-YYYYMM` overlap). |
+| `meta_criteria.historic_start_year` / `historic_end_year` | Year filter for `historical` experiment files (use with `--symmetrical` and mixed `experiment_id`). |
+| `meta_criteria.future_start_year` / `future_end_year` | Year filter for SSP experiment files (`ssp*`). When set, each experiment type uses its own range; unset bounds fall back to `start_year` / `end_year`. |
+| `search_criteria.member_id` | Ensemble member in YAML; sent to ESGF as `variant_label` (metagrid/CMIP6 standard). |
+| `meta_criteria.cache_negative_searches` | If `true`, reuse empty cached subsearches (skip re-querying ESGF). Default `false` so failed searches are retried. |
 
 Download errors are appended to a single session log under `logs/download_errors_<timestamp>.log` (path printed at startup and in batch summaries when failures occur).
 
-### Search analysis script
+### Search analysis
 
-`run_search_analysis` runs an ESGF search from `search.yaml`, analyzes source availability (which sources have both historical and SSP experiments, resolutions, ensemble counts), and optionally writes an `analysis_df.csv` plus PNG plots. It ignores `filter.top_n` and `filter.limit` so the analysis uses all matching results.
+`esgplus search-analysis` runs an ESGF search from `search.yaml`, analyzes source availability (which sources have both historical and SSP experiments, resolutions, ensemble counts), and optionally writes an `analysis_df.csv` plus PNG plots. It ignores `filter.top_n` and `filter.limit` so the analysis uses all matching results.
 
 **Run:**
 
 ```bash
-python run_search_analysis.py [OPTIONS]
+esgplus search-analysis
+esgplus search-analysis --output-dir notebooks/plots --no-show-plots
 ```
+
+Legacy: `python run_search_analysis.py [OPTIONS]`
 
 | Option | Default | Description |
 |--------|--------|-------------|
@@ -171,22 +215,24 @@ python run_search_analysis.py [OPTIONS]
 ---
 ## CDO regridding pipeline
 
-Single pipeline in `esgpull.esgpullplus.cdo_regrid`: regridding with regrid weights reuse, chunked and parallel processing. Supports **surface** (top level) and **seafloor** extraction: each writes a file next to the original (`*_top_level.nc`, `*_seafloor.nc`) and that file is regridded like any other. Or you can regrid the whole thing.
+Regridding uses the standalone **`cdo-toolkit`** package ([PyPI](https://pypi.org/project/cdo-toolkit/)). Install with `pip install "esgpull-plus[processing]"` (or `pip install cdo-toolkit`). It supports general NetCDF files, with optional CMIP6 filename helpers. Supports **surface** (top level) and **seafloor** extraction: each writes a file next to the original (`*_top_level.nc`, `*_seafloor.nc`) and that file is regridded like any other.
+
+You also need the **CDO binary** (e.g. `conda install -c conda-forge cdo`).
 
 ### Command line
 
 ```bash
 # Directory: surface only, tos variable only
-python -m esgpull.esgpullplus.cdo_regrid /path/to/dir -o /path/to/out -r 1.0 1.0 --extract-surface --variable tos
+cdo-toolkit /path/to/dir -o /path/to/out -r 1.0 1.0 --extract-surface --variable tos
 
 # Directory: seafloor only
-python -m esgpull.esgpullplus.cdo_regrid /path/to/dir -o /path/to/out --extract-seafloor --max-workers 2
+cdo-toolkit /path/to/dir -o /path/to/out --extract-seafloor --max-workers 2
 
 # Both surface and seafloor per file
-python -m esgpull.esgpullplus.cdo_regrid /path/to/dir --extreme-levels
+cdo-toolkit /path/to/dir --extreme-levels
 
 # Single file
-python -m esgpull.esgpullplus.cdo_regrid /path/to/file.nc -o /path/to/out.nc --extract-seafloor
+cdo-toolkit /path/to/file.nc -o /path/to/out.nc --extract-seafloor
 ```
 
 **Options:**
@@ -255,7 +301,7 @@ python -m esgpull.esgpullplus.file_watcher /path/to/watch \
 
 ```python
 from pathlib import Path
-from esgpull.esgpullplus.cdo_regrid import regrid_directory, regrid_single_file, CDORegridPipeline
+from cdo_toolkit import regrid_directory, regrid_single_file, CDORegridPipeline
 
 # Directory
 results = regrid_directory(
