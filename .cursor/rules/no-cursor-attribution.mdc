@@ -1,0 +1,15 @@
+---
+description: Never attribute commits, PRs, or code to Cursor
+alwaysApply: true
+---
+
+# No Cursor attribution
+
+Never add Cursor attribution anywhere in this repository:
+
+- Do not add `Co-authored-by: Cursor` / `cursoragent@cursor.com` trailers
+- Do not add `Made-with: Cursor` trailers
+- Do not use `git commit --trailer` for Cursor attribution
+- Do not mention Cursor in commit messages, PR bodies, or code comments as an author/tool credit
+
+If a Cursor/environment process injects attribution into a commit message, strip it before finishing (amend only when the commit was just created locally and not pushed).
